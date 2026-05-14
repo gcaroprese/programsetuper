@@ -6,111 +6,232 @@ Soporta Windows (.exe), macOS (.app) y Android (.apk).
 
 import os
 import sys
-import json
 import shutil
 import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
+from string import Template
 
-# --- Autostart helpers ---
+# --- Robust autostart + error logging wrapper ---
+# Uses string.Template ($var) to avoid brace escaping issues
 
-AUTOSTART_SCRIPT_TEMPLATE_WIN = r'''
-import os, sys, winreg
+AUTOSTART_WRAPPER = Template(r'''
+# === AUTOSTART + ERROR LOGGING BOOTSTRAP ===
+import os, sys, atexit, signal, threading, traceback, datetime
 
-def register_autostart(app_name, exe_path):
-    key = winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER,
-        r"Software\Microsoft\Windows\CurrentVersion\Run",
-        0, winreg.KEY_SET_VALUE
+_APP_NAME = $app_name_repr
+_PLATFORM = $platform_repr
+
+# --- 0. Prevent duplicate execution (PyInstaller --onefile spawns child process) ---
+import multiprocessing
+multiprocessing.freeze_support()
+
+def _get_app_dir():
+    """Directory where the executable lives."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _get_exe_path():
+    if getattr(sys, 'frozen', False):
+        return sys.executable
+    return os.path.abspath(__file__)
+
+# --- 1. Error logging to file next to executable ---
+_LOG_PATH = os.path.join(_get_app_dir(), _APP_NAME + '_error.log')
+
+def _log_error(msg):
+    try:
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        with open(_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(f'[{ts}] {msg}\n')
+    except Exception:
+        pass
+
+def _excepthook(exc_type, exc_value, exc_tb):
+    msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    _log_error(f'UNHANDLED EXCEPTION:\n{msg}')
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _excepthook
+
+def _thread_excepthook(args):
+    msg = ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    _log_error(f'THREAD EXCEPTION ({args.thread}):\n{msg}')
+
+if hasattr(threading, 'excepthook'):
+    threading.excepthook = _thread_excepthook
+
+# --- 2. Lock file with PID to avoid duplicate instances ---
+_LOCK_PATH = os.path.join(_get_app_dir(), '.' + _APP_NAME + '.lock')
+
+def _is_already_running():
+    if os.path.exists(_LOCK_PATH):
+        try:
+            with open(_LOCK_PATH, 'r') as f:
+                old_pid = int(f.read().strip())
+            if _PLATFORM == 'windows':
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(0x1000, False, old_pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+                if handle:
+                    kernel32.CloseHandle(handle)
+                    return True
+            else:
+                os.kill(old_pid, 0)
+                return True
+        except (ValueError, OSError, Exception):
+            pass
+    return False
+
+def _write_lock():
+    try:
+        with open(_LOCK_PATH, 'w') as f:
+            f.write(str(os.getpid()))
+    except Exception as e:
+        _log_error(f'Failed to write lock file: {e}')
+
+def _remove_lock():
+    try:
+        if os.path.exists(_LOCK_PATH):
+            os.remove(_LOCK_PATH)
+    except Exception:
+        pass
+
+if _is_already_running():
+    _log_error('Another instance is already running. Exiting.')
+    sys.exit(0)
+
+_write_lock()
+atexit.register(_remove_lock)
+
+def _signal_handler(signum, frame):
+    _remove_lock()
+    sys.exit(0)
+
+for _sig in (signal.SIGTERM, signal.SIGINT):
+    try:
+        signal.signal(_sig, _signal_handler)
+    except (OSError, ValueError):
+        pass
+
+if _PLATFORM == 'windows':
+    try:
+        signal.signal(signal.SIGBREAK, _signal_handler)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+# --- 3. Autostart registration (first run only) ---
+_MARKER_PATH = None
+if _PLATFORM == 'windows':
+    _MARKER_PATH = os.path.join(
+        os.environ.get('APPDATA', os.path.expanduser('~')),
+        _APP_NAME, '.autostart_installed'
     )
-    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
-    winreg.CloseKey(key)
+elif _PLATFORM == 'macos':
+    _MARKER_PATH = os.path.expanduser('~/.' + _APP_NAME + '_autostart_installed')
 
-def is_first_run(marker_path):
-    if not os.path.exists(marker_path):
-        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
-        with open(marker_path, 'w') as f:
-            f.write('installed')
-        return True
-    return False
+def _register_autostart():
+    exe_path = _get_exe_path()
+    if _MARKER_PATH is None:
+        return
+    if os.path.exists(_MARKER_PATH):
+        return
 
-if __name__ == '__main__':
-    pass
-'''
+    try:
+        if _PLATFORM == 'windows':
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_SET_VALUE
+            )
+            winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, exe_path)
+            winreg.CloseKey(key)
+            pass  # Registered OK
 
-AUTOSTART_SCRIPT_TEMPLATE_MAC = '''
-import os, plistlib
-
-def register_autostart(app_name, exe_path):
-    plist = {
-        'Label': app_name,
-        'ProgramArguments': [exe_path],
-        'RunAtLoad': True,
-    }
-    plist_path = os.path.expanduser(f'~/Library/LaunchAgents/{app_name}.plist')
-    with open(plist_path, 'wb') as f:
-        plistlib.dump(plist, f)
-
-def is_first_run(marker_path):
-    if not os.path.exists(marker_path):
-        os.makedirs(os.path.dirname(marker_path), exist_ok=True)
-        with open(marker_path, 'w') as f:
-            f.write('installed')
-        return True
-    return False
-
-if __name__ == '__main__':
-    pass
-'''
-
-AUTOSTART_WRAPPER = '''
-import os, sys
-
-_ORIGINAL_MAIN = {main_module!r}
-_APP_NAME = {app_name!r}
-_PLATFORM = {platform!r}
-
-def _setup_autostart():
-    exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
-    if _PLATFORM == 'windows':
-        import winreg
-        marker = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), _APP_NAME, '.installed')
-        if not os.path.exists(marker):
-            os.makedirs(os.path.dirname(marker), exist_ok=True)
-            with open(marker, 'w') as f:
-                f.write('1')
-            try:
-                key = winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                    0, winreg.KEY_SET_VALUE
-                )
-                winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, exe_path)
-                winreg.CloseKey(key)
-            except Exception:
-                pass
-    elif _PLATFORM == 'macos':
-        import plistlib
-        marker = os.path.expanduser(f'~/.{_APP_NAME}_installed')
-        if not os.path.exists(marker):
-            with open(marker, 'w') as f:
-                f.write('1')
-            plist = {{
+        elif _PLATFORM == 'macos':
+            import plistlib
+            plist = {
                 'Label': _APP_NAME,
                 'ProgramArguments': [exe_path],
                 'RunAtLoad': True,
-            }}
-            plist_path = os.path.expanduser(f'~/Library/LaunchAgents/{_APP_NAME}.plist')
-            try:
-                with open(plist_path, 'wb') as fp:
-                    plistlib.dump(plist, fp)
-            except Exception:
-                pass
+                'KeepAlive': False,
+            }
+            plist_dir = os.path.expanduser('~/Library/LaunchAgents')
+            os.makedirs(plist_dir, exist_ok=True)
+            plist_path = os.path.join(plist_dir, _APP_NAME + '.plist')
+            with open(plist_path, 'wb') as fp:
+                plistlib.dump(plist, fp)
+            pass  # Registered OK
 
-_setup_autostart()
-'''
+        # Mark as installed only after success
+        os.makedirs(os.path.dirname(_MARKER_PATH), exist_ok=True)
+        with open(_MARKER_PATH, 'w') as f:
+            f.write(str(os.getpid()))
+
+    except Exception as e:
+        _log_error(f'Autostart registration FAILED: {e}\n{traceback.format_exc()}')
+
+# --- 4. Run autostart with retry every hour if it fails ---
+_RETRY_INTERVAL = 3600  # 1 hour in seconds
+_RETRY_MAX = 8
+_autostart_done = threading.Event()
+
+def _autostart_worker():
+    try:
+        _register_autostart()
+    except Exception as e:
+        _log_error(f'Autostart worker error: {e}')
+    finally:
+        _autostart_done.set()
+
+def _autostart_retry_loop():
+    """If autostart not yet installed, retry every hour in background (max 8 attempts)."""
+    if _MARKER_PATH is None:
+        return
+    for attempt in range(1, _RETRY_MAX + 1):
+        if os.path.exists(_MARKER_PATH):
+            return
+        _stop_retry.wait(timeout=_RETRY_INTERVAL)
+        if _stop_retry.is_set():
+            return
+        try:
+            _register_autostart()
+            if os.path.exists(_MARKER_PATH):
+                return
+        except Exception as e:
+            _log_error(f'Autostart retry {attempt}/{_RETRY_MAX} FAILED: {e}')
+    _log_error(f'Autostart gave up after {_RETRY_MAX} retries.')
+
+_stop_retry = threading.Event()
+
+def _stop_retry_on_exit():
+    _stop_retry.set()
+
+atexit.register(_stop_retry_on_exit)
+
+# First attempt (blocking, 10s timeout)
+_autostart_thread = threading.Thread(target=_autostart_worker, daemon=True)
+_autostart_thread.start()
+_autostart_done.wait(timeout=10)
+
+# If first attempt failed, start hourly retry in background
+if _MARKER_PATH and not os.path.exists(_MARKER_PATH):
+    _retry_thread = threading.Thread(target=_autostart_retry_loop, daemon=True)
+    _retry_thread.start()
+
+# --- 5. Fix working directory to exe location ---
+# PyInstaller --onefile extracts to a temp dir; ensure cwd and .env are found next to the exe
+os.chdir(_get_app_dir())
+if os.path.exists(os.path.join(_get_app_dir(), '.env')):
+    os.environ.setdefault('DOTENV_PATH', os.path.join(_get_app_dir(), '.env'))
+
+# Only log errors, not normal startup
+# === END AUTOSTART BOOTSTRAP ===
+''')
 
 
 class VenvToExeApp:
@@ -128,6 +249,8 @@ class VenvToExeApp:
         self.output_dir = tk.StringVar()
         self.autostart = tk.BooleanVar(value=True)
         self.onefile = tk.BooleanVar(value=True)
+        self.noconsole = tk.BooleanVar(value=True)
+        self.extra_files = tk.StringVar()
 
         self._build_ui()
 
@@ -195,6 +318,15 @@ class VenvToExeApp:
         self.autostart_check.pack(side=tk.LEFT, padx=10)
 
         ttk.Checkbutton(opt_frame, text="Un solo archivo", variable=self.onefile).pack(side=tk.LEFT, padx=10)
+        ttk.Checkbutton(opt_frame, text="Sin consola (background)", variable=self.noconsole).pack(side=tk.LEFT, padx=10)
+
+        # --- Extra files (.env, configs, data) ---
+        row = ttk.Frame(main)
+        row.pack(fill=tk.X, pady=3)
+        ttk.Label(row, text="Archivos extra:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.extra_files).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(row, text="Agregar", command=self._browse_extra_files).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Label(main, text="  (archivos .env, configs, datos - separados por ;)", foreground="gray").pack(anchor=tk.W)
 
         # --- Build button ---
         self.build_btn = ttk.Button(main, text="COMPILAR", command=self._start_build)
@@ -240,6 +372,19 @@ class VenvToExeApp:
             self.icon_preview_label.config(text=f"Icono: {os.path.basename(path)}", image="")
         except Exception:
             self.icon_preview_label.config(text=f"Icono: {os.path.basename(path)}", image="")
+
+    def _browse_extra_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Seleccionar archivos extra (.env, configs, datos)",
+            filetypes=[("Todos", "*.*")]
+        )
+        if paths:
+            current = self.extra_files.get()
+            new_paths = ";".join(paths)
+            if current:
+                self.extra_files.set(current + ";" + new_paths)
+            else:
+                self.extra_files.set(new_paths)
 
     def _browse_output(self):
         path = filedialog.askdirectory(title="Seleccionar carpeta de salida")
@@ -336,10 +481,9 @@ class VenvToExeApp:
         with open(script_path, 'r', encoding='utf-8') as f:
             original_code = f.read()
 
-        wrapper = AUTOSTART_WRAPPER.format(
-            main_module=os.path.basename(script_path),
-            app_name=app_name,
-            platform=plat,
+        wrapper = AUTOSTART_WRAPPER.substitute(
+            app_name_repr=repr(app_name),
+            platform_repr=repr(plat),
         )
 
         temp_dir = os.path.join(self.output_dir.get(), "_temp_build")
@@ -350,6 +494,56 @@ class VenvToExeApp:
             f.write(wrapper + "\n" + original_code)
 
         return temp_script
+
+    def _get_extra_files(self):
+        """Return list of extra file paths from the entry field."""
+        raw = self.extra_files.get().strip()
+        if not raw:
+            return []
+        return [p.strip() for p in raw.split(";") if p.strip() and os.path.isfile(p.strip())]
+
+    def _copy_extra_files_to_output(self, output_dir, app_name):
+        """Copy extra files next to the executable for runtime access."""
+        for fpath in self._get_extra_files():
+            dst = os.path.join(output_dir, os.path.basename(fpath))
+            try:
+                shutil.copy2(fpath, dst)
+                self.root.after(0, lambda d=dst: self._log(f"[INFO] Archivo extra copiado: {d}"))
+            except Exception as e:
+                self.root.after(0, lambda e=e: self._log(f"[AVISO] No se pudo copiar archivo extra: {e}"))
+
+    def _detect_hidden_imports(self, site_packages):
+        """Scan site-packages for native modules PyInstaller often misses."""
+        hidden = []
+        # Packages known to have native CFFI/C extensions PyInstaller misses
+        problem_packages = {
+            'coincurve': ['coincurve._cffi_backend', 'coincurve._libsecp256k1'],
+            'nacl': ['nacl._sodium'],
+            'cryptography': ['cryptography.hazmat.bindings._rust'],
+            'bcrypt': ['bcrypt._bcrypt'],
+            'argon2': ['argon2._ffi'],
+            'lxml': ['lxml._elementpath'],
+            'cffi': ['_cffi_backend'],
+        }
+        for pkg, imports in problem_packages.items():
+            pkg_dir = os.path.join(site_packages, pkg)
+            if os.path.isdir(pkg_dir):
+                hidden.extend(imports)
+        return hidden
+
+    def _collect_native_binaries(self, site_packages):
+        """Find .pyd/.so files that need to be explicitly included."""
+        binaries = []
+        problem_packages = ['coincurve', 'nacl', 'cffi']
+        for pkg in problem_packages:
+            pkg_dir = os.path.join(site_packages, pkg)
+            if not os.path.isdir(pkg_dir):
+                continue
+            for f in os.listdir(pkg_dir):
+                if f.endswith(('.pyd', '.so', '.dll')):
+                    src = os.path.join(pkg_dir, f)
+                    binaries.append((src, pkg))
+        return binaries
 
     def _convert_icon_to_ico(self, icon_path):
         """Convert png to ico if needed for Windows."""
@@ -405,13 +599,18 @@ class VenvToExeApp:
         except Exception:
             self.root.after(0, lambda: self._log("[AVISO] No se pudo instalar PyInstaller en venv, usando el del sistema."))
 
+        # Use temp dir in user's TEMP folder to avoid antivirus interference
+        import tempfile
+        build_tmp = tempfile.mkdtemp(prefix=f"{app_name}_build_")
+        self.root.after(0, lambda: self._log(f"[INFO] Carpeta temporal de build: {build_tmp}"))
+
         # Build command
         cmd = [
             venv_python, "-m", "PyInstaller",
             "--name", app_name,
-            "--distpath", output,
-            "--workpath", os.path.join(output, "_build_work"),
-            "--specpath", os.path.join(output, "_build_work"),
+            "--distpath", build_tmp,
+            "--workpath", os.path.join(build_tmp, "work"),
+            "--specpath", os.path.join(build_tmp, "work"),
             "--paths", site_packages,
             "--noconfirm",
             "--clean",
@@ -420,23 +619,56 @@ class VenvToExeApp:
         if self.onefile.get():
             cmd.append("--onefile")
 
+        if self.noconsole.get():
+            cmd.append("--noconsole")
+
         icon = self.icon_path.get()
         if icon:
             ico = self._convert_icon_to_ico(icon)
             if ico:
                 cmd.extend(["--icon", ico])
 
+        # Auto-detect hidden imports and native binaries
+        hidden_imports = self._detect_hidden_imports(site_packages)
+        for hi in hidden_imports:
+            cmd.extend(["--hidden-import", hi])
+        if hidden_imports:
+            self.root.after(0, lambda h=hidden_imports: self._log(f"[INFO] Hidden imports detectados: {', '.join(h)}"))
+
+        native_bins = self._collect_native_binaries(site_packages)
+        for src, dest_pkg in native_bins:
+            cmd.extend(["--add-binary", f"{src}{os.pathsep}{dest_pkg}"])
+        if native_bins:
+            self.root.after(0, lambda n=native_bins: self._log(f"[INFO] Binarios nativos incluidos: {len(n)}"))
+
+        # Add extra files (.env, configs, etc.)
+        for fpath in self._get_extra_files():
+            cmd.extend(["--add-data", f"{fpath}{os.pathsep}."])
+
         cmd.append(script)
 
         self._run_cmd(cmd)
+
+        # Move exe from temp to final output
+        exe_name = app_name + ".exe"
+        src_exe = os.path.join(build_tmp, exe_name)
+        dst_exe = os.path.join(output, exe_name)
+        if os.path.isfile(src_exe):
+            if os.path.isfile(dst_exe):
+                os.remove(dst_exe)
+            shutil.move(src_exe, dst_exe)
+            self.root.after(0, lambda: self._log(f"[INFO] Ejecutable movido a: {dst_exe}"))
+        else:
+            raise RuntimeError(f"No se encontro el exe generado en: {src_exe}")
+
+        # Copy extra files next to exe as well (for --onefile they extract to temp)
+        self._copy_extra_files_to_output(output, app_name)
 
         # Cleanup temp
         temp_dir = os.path.join(output, "_temp_build")
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        work_dir = os.path.join(output, "_build_work")
-        if os.path.isdir(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(build_tmp, ignore_errors=True)
 
         self.root.after(0, lambda: self._log(f"\n[OK] Ejecutable Windows generado en: {output}"))
         self.root.after(0, lambda: messagebox.showinfo("Listo", f"Ejecutable generado en:\n{output}"))
@@ -460,12 +692,16 @@ class VenvToExeApp:
         except Exception:
             self.root.after(0, lambda: self._log("[AVISO] No se pudo instalar PyInstaller en venv, usando el del sistema."))
 
+        import tempfile
+        build_tmp = tempfile.mkdtemp(prefix=f"{app_name}_build_")
+        self.root.after(0, lambda: self._log(f"[INFO] Carpeta temporal de build: {build_tmp}"))
+
         cmd = [
             venv_python, "-m", "PyInstaller",
             "--name", app_name,
-            "--distpath", output,
-            "--workpath", os.path.join(output, "_build_work"),
-            "--specpath", os.path.join(output, "_build_work"),
+            "--distpath", build_tmp,
+            "--workpath", os.path.join(build_tmp, "work"),
+            "--specpath", os.path.join(build_tmp, "work"),
             "--paths", site_packages,
             "--noconfirm",
             "--clean",
@@ -477,24 +713,44 @@ class VenvToExeApp:
 
         icon = self.icon_path.get()
         if icon:
-            # macOS uses .icns format
-            if icon.lower().endswith('.icns'):
-                cmd.extend(["--icon", icon])
-            elif icon.lower().endswith('.png'):
-                cmd.extend(["--icon", icon])  # PyInstaller can handle png on mac
-            else:
-                cmd.extend(["--icon", icon])
+            cmd.extend(["--icon", icon])
+
+        hidden_imports = self._detect_hidden_imports(site_packages)
+        for hi in hidden_imports:
+            cmd.extend(["--hidden-import", hi])
+
+        native_bins = self._collect_native_binaries(site_packages)
+        for src, dest_pkg in native_bins:
+            cmd.extend(["--add-binary", f"{src}{os.pathsep}{dest_pkg}"])
+
+        for fpath in self._get_extra_files():
+            cmd.extend(["--add-data", f"{fpath}{os.pathsep}."])
 
         cmd.append(script)
 
         self._run_cmd(cmd)
 
+        # Move result to final output
+        for item in os.listdir(build_tmp):
+            if item == "work":
+                continue
+            src = os.path.join(build_tmp, item)
+            dst = os.path.join(output, item)
+            if os.path.isfile(src):
+                if os.path.isfile(dst):
+                    os.remove(dst)
+                shutil.move(src, dst)
+            elif os.path.isdir(src):
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                shutil.move(src, dst)
+
+        self._copy_extra_files_to_output(output, app_name)
+
         temp_dir = os.path.join(output, "_temp_build")
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
-        work_dir = os.path.join(output, "_build_work")
-        if os.path.isdir(work_dir):
-            shutil.rmtree(work_dir, ignore_errors=True)
+        shutil.rmtree(build_tmp, ignore_errors=True)
 
         self.root.after(0, lambda: self._log(f"\n[OK] Aplicacion macOS generada en: {output}"))
         self.root.after(0, lambda: messagebox.showinfo("Listo", f"Aplicacion generada en:\n{output}"))
