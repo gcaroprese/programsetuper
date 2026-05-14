@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.ico
+*.png
+*.spec
+build/
+dist/
+_build_work/
+_temp_build/
+*.egg-info/
+create_shortcut.ps1
