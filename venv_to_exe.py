@@ -755,37 +755,137 @@ class VenvToExeApp:
         self.root.after(0, lambda: self._log(f"\n[OK] Aplicacion macOS generada en: {output}"))
         self.root.after(0, lambda: messagebox.showinfo("Listo", f"Aplicacion generada en:\n{output}"))
 
+    def _wsl_path(self, win_path):
+        """Convert Windows path to WSL path."""
+        win_path = os.path.abspath(win_path)
+        drive = win_path[0].lower()
+        rest = win_path[2:].replace("\\", "/")
+        return f"/mnt/{drive}{rest}"
+
+    def _check_wsl(self):
+        """Check if WSL is available and has a distro installed."""
+        try:
+            r = subprocess.run(["wsl", "--list", "--quiet"], capture_output=True, text=True, errors='replace')
+            distros = [l.strip().replace('\x00', '') for l in r.stdout.strip().split('\n') if l.strip().replace('\x00', '')]
+            if r.returncode == 0 and distros:
+                return distros[0]
+        except FileNotFoundError:
+            pass
+        return None
+
+    def _run_wsl_cmd(self, bash_script, cwd_wsl=None):
+        """Run a bash script inside WSL."""
+        cmd = ["wsl", "--", "bash", "-c", bash_script]
+        if cwd_wsl:
+            cmd = ["wsl", "--", "bash", "-c", f"cd '{cwd_wsl}' && {bash_script}"]
+        self.root.after(0, lambda: self._log(f"[WSL] $ {bash_script[:120]}..."))
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors='replace'
+        )
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                self.root.after(0, lambda l=line: self._log(l))
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"Comando WSL fallo con codigo {proc.returncode}")
+
+    def _install_wsl(self):
+        """Install WSL with Ubuntu."""
+        self.root.after(0, lambda: self._log("[INFO] Instalando WSL con Ubuntu..."))
+        self.root.after(0, lambda: self._log("[INFO] Esto requiere permisos de administrador."))
+        self.root.after(0, lambda: self._log("[INFO] Si aparece UAC, acepta el permiso."))
+        try:
+            proc = subprocess.Popen(
+                ["powershell", "-Command",
+                 "Start-Process wsl -ArgumentList '--install --distribution Ubuntu' -Verb RunAs -Wait"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors='replace'
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    self.root.after(0, lambda l=line: self._log(l))
+            proc.wait()
+        except Exception as e:
+            raise RuntimeError(f"No se pudo instalar WSL: {e}")
+
+        # Verify
+        import time
+        time.sleep(3)
+        distro = self._check_wsl()
+        if not distro:
+            raise RuntimeError(
+                "WSL se instalo pero necesita reiniciar el equipo.\n"
+                "Reinicia Windows y vuelve a intentar la compilacion Android."
+            )
+        return distro
+
+    def _setup_wsl_buildozer(self):
+        """Install buildozer and dependencies inside WSL."""
+        self.root.after(0, lambda: self._log("[INFO] Configurando entorno buildozer en WSL..."))
+
+        setup_script = """
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+# Update and install system dependencies
+sudo apt-get update -qq
+sudo apt-get install -y -qq python3 python3-pip python3-venv \\
+    build-essential git zip unzip openjdk-17-jdk \\
+    autoconf automake libtool pkg-config \\
+    libffi-dev libssl-dev \\
+    cmake \\
+    zlib1g-dev libncurses5-dev libncursesw5-dev \\
+    2>/dev/null
+
+# Install buildozer and cython
+pip3 install --user --break-system-packages buildozer cython 2>/dev/null || \\
+pip3 install --user buildozer cython
+
+echo "SETUP_COMPLETE"
+"""
+        self._run_wsl_cmd(setup_script)
+
     def _build_android(self):
         self.root.after(0, lambda: self._log("=== Compilando para Android (APK) ==="))
-        self.root.after(0, lambda: self._log("[INFO] Se usara Buildozer + python-for-android."))
 
         script = self.entry_script.get()
         app_name = self.app_name.get().strip()
         output = self.output_dir.get()
+        is_windows = sys.platform == 'win32'
 
-        # Check for buildozer
-        try:
-            subprocess.run(["buildozer", "--version"], capture_output=True, check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            self.root.after(0, lambda: self._log("[INFO] Instalando buildozer..."))
-            try:
-                self._run_cmd([sys.executable, "-m", "pip", "install", "buildozer", "cython"])
-            except Exception as e:
-                raise RuntimeError(
-                    "No se pudo instalar buildozer. Asegurate de tener:\n"
-                    "- Linux o WSL (buildozer no funciona nativamente en Windows)\n"
-                    "- Java JDK, Android SDK/NDK\n"
-                    f"Error: {e}"
-                )
+        if is_windows:
+            self.root.after(0, lambda: self._log("[INFO] Windows detectado, se usara WSL para compilar."))
+
+            # Check/install WSL
+            distro = self._check_wsl()
+            if not distro:
+                self.root.after(0, lambda: self._log("[INFO] WSL no encontrado. Instalando..."))
+                distro = self._install_wsl()
+            self.root.after(0, lambda: self._log(f"[INFO] Usando distro WSL: {distro}"))
+
+            # Check if buildozer is installed in WSL
+            r = subprocess.run(
+                ["wsl", "--", "bash", "-c", "which buildozer 2>/dev/null || echo NOTFOUND"],
+                capture_output=True, text=True, errors='replace'
+            )
+            if 'NOTFOUND' in r.stdout:
+                self._setup_wsl_buildozer()
 
         # Create buildozer project directory
         build_dir = os.path.join(output, f"{app_name}_android_build")
         os.makedirs(build_dir, exist_ok=True)
 
-        # Copy the script and venv packages
+        # Copy the script
         shutil.copy2(script, os.path.join(build_dir, "main.py"))
 
-        # Copy site-packages content for requirements
+        # Copy extra files
+        for fpath in self._get_extra_files():
+            shutil.copy2(fpath, os.path.join(build_dir, os.path.basename(fpath)))
+
+        # Get requirements from venv
         venv_python = self._get_venv_python()
         result = subprocess.run(
             [venv_python, "-m", "pip", "freeze"],
@@ -795,7 +895,9 @@ class VenvToExeApp:
         for line in result.stdout.strip().split('\n'):
             if line and not line.startswith('#'):
                 pkg = line.split('==')[0].strip()
-                if pkg.lower() not in ('pip', 'setuptools', 'wheel'):
+                if pkg.lower() not in ('pip', 'setuptools', 'wheel', 'pyinstaller',
+                                        'pyinstaller-hooks-contrib', 'pywin32',
+                                        'pywin32-ctypes', 'pefile', 'altgraph'):
                     requirements.append(pkg)
 
         reqs_str = ",".join(requirements) if requirements else "kivy"
@@ -806,12 +908,13 @@ class VenvToExeApp:
         if icon:
             shutil.copy2(icon, os.path.join(build_dir, os.path.basename(icon)))
 
+        pkg_name = app_name.lower().replace(' ', '_').replace('-', '_')
         spec_content = f"""[app]
 title = {app_name}
-package.name = {app_name.lower().replace(' ', '_')}
+package.name = {pkg_name}
 package.domain = org.test
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,ico
+source.include_exts = py,png,jpg,kv,atlas,ico,env,json,txt
 version = 1.0.0
 requirements = python3,{reqs_str}
 {icon_line}
@@ -820,39 +923,53 @@ fullscreen = 0
 android.permissions = INTERNET
 android.api = 33
 android.minapi = 21
-android.archs = arm64-v8a, armeabi-v7a
+android.archs = arm64-v8a
 
 [buildozer]
 log_level = 2
-warn_on_root = 1
+warn_on_root = 0
 """
         spec_path = os.path.join(build_dir, "buildozer.spec")
-        with open(spec_path, 'w') as f:
+        with open(spec_path, 'w', newline='\n') as f:
             f.write(spec_content)
 
         self.root.after(0, lambda: self._log(f"[INFO] Proyecto buildozer creado en: {build_dir}"))
         self.root.after(0, lambda: self._log("[INFO] Ejecutando buildozer android debug..."))
-        self.root.after(0, lambda: self._log("[NOTA] Esto puede tardar bastante la primera vez (descarga SDK/NDK)."))
+        self.root.after(0, lambda: self._log("[NOTA] La primera vez tarda mucho (descarga SDK/NDK ~1GB)."))
 
-        try:
-            self._run_cmd(["buildozer", "android", "debug"], cwd=build_dir)
-        except RuntimeError:
-            # Check if APK was generated despite error
-            bin_dir = os.path.join(build_dir, "bin")
-            if os.path.isdir(bin_dir) and any(f.endswith('.apk') for f in os.listdir(bin_dir)):
-                self.root.after(0, lambda: self._log("[AVISO] Buildozer reporto errores pero se genero el APK."))
-            else:
-                raise RuntimeError(
-                    "Fallo la compilacion Android. Requisitos:\n"
-                    "- Linux o WSL2 (buildozer no funciona en Windows nativo)\n"
-                    "- Java JDK 17\n"
-                    "- Buildozer instalado: pip install buildozer cython\n"
-                    "- Dependencias del sistema: sudo apt install autoconf automake libtool pkg-config\n"
-                    "Revisa el log para mas detalles."
-                )
+        # Run buildozer
+        if is_windows:
+            wsl_build_dir = self._wsl_path(build_dir)
+            # Convert line endings and run via WSL
+            build_script = f"""
+export PATH="$HOME/.local/bin:$PATH"
+cd '{wsl_build_dir}'
+find . -name '*.py' -exec sed -i 's/\\r$//' {{}} \\;
+sed -i 's/\\r$//' buildozer.spec
+buildozer android debug 2>&1
+"""
+            try:
+                self._run_wsl_cmd(build_script)
+            except RuntimeError:
+                bin_dir = os.path.join(build_dir, "bin")
+                if os.path.isdir(bin_dir) and any(f.endswith('.apk') for f in os.listdir(bin_dir)):
+                    self.root.after(0, lambda: self._log("[AVISO] Buildozer reporto errores pero se genero el APK."))
+                else:
+                    raise
+        else:
+            # Linux/macOS native
+            try:
+                self._run_cmd(["buildozer", "android", "debug"], cwd=build_dir)
+            except RuntimeError:
+                bin_dir = os.path.join(build_dir, "bin")
+                if os.path.isdir(bin_dir) and any(f.endswith('.apk') for f in os.listdir(bin_dir)):
+                    self.root.after(0, lambda: self._log("[AVISO] Buildozer reporto errores pero se genero el APK."))
+                else:
+                    raise
 
         # Move APK to output
         bin_dir = os.path.join(build_dir, "bin")
+        apk_found = False
         if os.path.isdir(bin_dir):
             for f in os.listdir(bin_dir):
                 if f.endswith('.apk'):
@@ -860,9 +977,13 @@ warn_on_root = 1
                     dst = os.path.join(output, f)
                     shutil.copy2(src, dst)
                     self.root.after(0, lambda d=dst: self._log(f"[OK] APK copiado a: {d}"))
+                    apk_found = True
 
-        self.root.after(0, lambda: self._log(f"\n[OK] APK Android generado en: {output}"))
-        self.root.after(0, lambda: messagebox.showinfo("Listo", f"APK generado en:\n{output}"))
+        if apk_found:
+            self.root.after(0, lambda: self._log(f"\n[OK] APK Android generado en: {output}"))
+            self.root.after(0, lambda: messagebox.showinfo("Listo", f"APK generado en:\n{output}"))
+        else:
+            raise RuntimeError("No se encontro el APK generado. Revisa el log para detalles.")
 
 
 def main():
