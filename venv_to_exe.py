@@ -14,6 +14,15 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from string import Template
 
+def _hide_windows():
+    """Return startupinfo and creationflags to hide CMD windows on Windows."""
+    if sys.platform == 'win32':
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        return {'startupinfo': si, 'creationflags': subprocess.CREATE_NO_WINDOW}
+    return {}
+
 # --- Robust autostart + error logging wrapper ---
 # Uses string.Template ($var) to avoid brace escaping issues
 
@@ -571,15 +580,10 @@ class VenvToExeApp:
 
     def _run_cmd(self, cmd, cwd=None, env=None):
         self.root.after(0, lambda: self._log(f"$ {' '.join(cmd)}"))
-        startupinfo = None
-        if sys.platform == 'win32':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 0  # SW_HIDE
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             cwd=cwd, env=env, text=True, errors='replace',
-            startupinfo=startupinfo,
+            **_hide_windows(),
         )
         for line in proc.stdout:
             line = line.rstrip()
@@ -783,7 +787,7 @@ class VenvToExeApp:
         # 1. Check gh CLI
         self.root.after(0, lambda: self._log("[INFO] Verificando GitHub CLI..."))
         try:
-            r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, errors='replace')
+            r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, errors='replace', **_hide_windows())
             if r.returncode != 0:
                 raise RuntimeError("no auth")
             self.root.after(0, lambda: self._log("[OK] GitHub CLI autenticado."))
@@ -798,7 +802,7 @@ class VenvToExeApp:
 
         # 2. Get requirements
         venv_python = self._get_venv_python()
-        result = subprocess.run([venv_python, "-m", "pip", "freeze"], capture_output=True, text=True)
+        result = subprocess.run([venv_python, "-m", "pip", "freeze"], capture_output=True, text=True, **_hide_windows())
         skip_pkgs = {'pip', 'setuptools', 'wheel', 'pyinstaller', 'pyinstaller_hooks_contrib',
                       'pywin32', 'pywin32_ctypes', 'pefile', 'altgraph', 'colorama',
                       'pyreadline3', 'pywin32'}
@@ -902,7 +906,7 @@ jobs:
 
         # Delete repo if it already exists from a previous build
         subprocess.run(["gh", "repo", "delete", repo_name, "--yes"],
-                        capture_output=True, errors='replace')
+                        capture_output=True, errors='replace', **_hide_windows())
 
         # Init git, commit, create repo, push
         self._run_cmd(["git", "init"], cwd=build_dir)
@@ -925,7 +929,7 @@ jobs:
 
             r = subprocess.run(
                 ["gh", "run", "list", "--repo", repo_name, "--limit", "1", "--json", "databaseId,status,conclusion"],
-                capture_output=True, text=True, errors='replace'
+                capture_output=True, text=True, errors='replace', **_hide_windows()
             )
             try:
                 import json
@@ -946,7 +950,7 @@ jobs:
                         else:
                             # Show logs
                             subprocess.run(["gh", "run", "view", str(run_id), "--repo", repo_name, "--log-failed"],
-                                            capture_output=True)
+                                            capture_output=True, **_hide_windows())
                             raise RuntimeError(f"Build fallo con: {conclusion}")
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
@@ -979,7 +983,7 @@ jobs:
 
         # 7. Cleanup: delete temp repo and local dirs
         self.root.after(0, lambda: self._log("[INFO] Limpiando repo temporal..."))
-        subprocess.run(["gh", "repo", "delete", repo_name, "--yes"], capture_output=True, errors='replace')
+        subprocess.run(["gh", "repo", "delete", repo_name, "--yes"], capture_output=True, errors='replace', **_hide_windows())
         shutil.rmtree(build_dir, ignore_errors=True)
         shutil.rmtree(dl_dir, ignore_errors=True)
 
