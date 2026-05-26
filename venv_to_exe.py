@@ -867,7 +867,9 @@ warn_on_root = 0
         os.makedirs(wf_dir, exist_ok=True)
         with open(os.path.join(wf_dir, "build-apk.yml"), 'w', newline='\n') as f:
             f.write("""name: Build APK
-on: [push]
+on:
+  push:
+  workflow_dispatch:
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -908,8 +910,9 @@ jobs:
         subprocess.run(["gh", "repo", "delete", repo_name, "--yes"],
                         capture_output=True, errors='replace', **_hide_windows())
 
-        # Init git, commit, create repo, push
+        # Init git, force LF line endings, commit, create repo, push
         self._run_cmd(["git", "init"], cwd=build_dir)
+        self._run_cmd(["git", "config", "core.autocrlf", "input"], cwd=build_dir)
         self._run_cmd(["git", "add", "-A"], cwd=build_dir)
         self._run_cmd(["git", "commit", "-m", "APK build"], cwd=build_dir)
         self._run_cmd(["gh", "repo", "create", repo_name, "--private", "--source=.", "--push"], cwd=build_dir)
