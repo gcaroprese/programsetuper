@@ -800,18 +800,20 @@ class VenvToExeApp:
                 "GitHub CLI (gh) no esta autenticado.\n"
                 "Ejecuta 'gh auth login' en una terminal y reintenta.")
 
-        # 2. Get requirements
+        # 2. Get top-level requirements only (pip resolves compatible transitive deps)
         venv_python = self._get_venv_python()
-        result = subprocess.run([venv_python, "-m", "pip", "freeze"], capture_output=True, text=True, **_hide_windows())
-        skip_pkgs = {'pip', 'setuptools', 'wheel', 'pyinstaller', 'pyinstaller_hooks_contrib',
-                      'pywin32', 'pywin32_ctypes', 'pefile', 'altgraph', 'colorama',
-                      'pyreadline3', 'pywin32'}
-        reqs = []
-        for line in result.stdout.strip().split('\n'):
-            if line and not line.startswith('#'):
-                name = line.split('==')[0].strip().lower().replace('-', '_')
-                if name not in skip_pkgs:
-                    reqs.append(line.strip())
+        result = subprocess.run(
+            [venv_python, "-c",
+             "import pkg_resources;"
+             "all_p={p.key for p in pkg_resources.working_set};"
+             "deps=set();"
+             "[deps.update(r.key for r in p.requires()) for p in pkg_resources.working_set];"
+             "skip={'pip','setuptools','wheel','pyinstaller','pywin32','pywin32-ctypes','pefile','altgraph','pyinstaller-hooks-contrib'};"
+             "top=all_p-deps-skip;"
+             "[print(p.key) for p in pkg_resources.working_set if p.key in top]"],
+            capture_output=True, text=True, **_hide_windows()
+        )
+        reqs = [r.strip() for r in result.stdout.strip().split('\n') if r.strip()]
         reqs_txt = '\n'.join(reqs)
 
         # 3. Create temp build directory with all needed files
