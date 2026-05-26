@@ -563,11 +563,11 @@ class VenvToExeApp:
             self.root.after(0, lambda: self._log(f"[AVISO] No se pudo convertir icono: {e}"))
             return None
 
-    def _run_cmd(self, cmd, cwd=None):
+    def _run_cmd(self, cmd, cwd=None, env=None):
         self.root.after(0, lambda: self._log(f"$ {' '.join(cmd)}"))
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=cwd, text=True, errors='replace'
+            cwd=cwd, env=env, text=True, errors='replace'
         )
         for line in proc.stdout:
             line = line.rstrip()
@@ -755,229 +755,445 @@ class VenvToExeApp:
         self.root.after(0, lambda: self._log(f"\n[OK] Aplicacion macOS generada en: {output}"))
         self.root.after(0, lambda: messagebox.showinfo("Listo", f"Aplicacion generada en:\n{output}"))
 
-    def _wsl_path(self, win_path):
-        """Convert Windows path to WSL path."""
-        win_path = os.path.abspath(win_path)
-        drive = win_path[0].lower()
-        rest = win_path[2:].replace("\\", "/")
-        return f"/mnt/{drive}{rest}"
-
-    def _check_wsl(self):
-        """Check if WSL is available and has a distro installed."""
+    def _find_java_home(self):
+        """Find a suitable JDK (17+) for Android builds."""
+        # Check JAVA_HOME first
+        jh = os.environ.get('JAVA_HOME')
+        if jh and os.path.isdir(jh):
+            return jh
+        # Search common locations on Windows
+        if sys.platform == 'win32':
+            search_dirs = [
+                os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'), 'Eclipse Adoptium'),
+                os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'), 'Java'),
+                os.path.join(os.environ.get('ProgramFiles', 'C:\\Program Files'), 'Microsoft'),
+            ]
+            for base in search_dirs:
+                if not os.path.isdir(base):
+                    continue
+                for d in sorted(os.listdir(base), reverse=True):
+                    candidate = os.path.join(base, d)
+                    javac = os.path.join(candidate, 'bin', 'javac.exe')
+                    if os.path.isfile(javac):
+                        return candidate
+        # Fallback: use 'where javac' / 'which javac'
         try:
-            r = subprocess.run(["wsl", "--list", "--quiet"], capture_output=True, text=True, errors='replace')
-            distros = [l.strip().replace('\x00', '') for l in r.stdout.strip().split('\n') if l.strip().replace('\x00', '')]
-            if r.returncode == 0 and distros:
-                return distros[0]
-        except FileNotFoundError:
+            r = subprocess.run(['where' if sys.platform == 'win32' else 'which', 'javac'],
+                                capture_output=True, text=True)
+            if r.returncode == 0:
+                javac_path = r.stdout.strip().split('\n')[0].strip()
+                return str(Path(javac_path).parent.parent)
+        except Exception:
             pass
         return None
 
-    def _run_wsl_cmd(self, bash_script, cwd_wsl=None):
-        """Run a bash script inside WSL."""
-        cmd = ["wsl", "--", "bash", "-c", bash_script]
-        if cwd_wsl:
-            cmd = ["wsl", "--", "bash", "-c", f"cd '{cwd_wsl}' && {bash_script}"]
-        self.root.after(0, lambda: self._log(f"[WSL] $ {bash_script[:120]}..."))
+    def _setup_android_sdk(self, sdk_root):
+        """Download and set up Android SDK command-line tools."""
+        import urllib.request
+        import zipfile
+
+        os.makedirs(sdk_root, exist_ok=True)
+        cmdline_dir = os.path.join(sdk_root, 'cmdline-tools', 'latest')
+
+        if os.path.isdir(cmdline_dir) and os.path.isfile(os.path.join(cmdline_dir, 'bin', 'sdkmanager.bat' if sys.platform == 'win32' else 'sdkmanager')):
+            return  # Already installed
+
+        self.root.after(0, lambda: self._log("[INFO] Descargando Android SDK command-line tools..."))
+
+        if sys.platform == 'win32':
+            url = "https://dl.google.com/android/repository/commandlinetools-win-11076708_latest.zip"
+        elif sys.platform == 'darwin':
+            url = "https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip"
+        else:
+            url = "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+
+        zip_path = os.path.join(sdk_root, 'cmdline-tools.zip')
+        urllib.request.urlretrieve(url, zip_path)
+
+        self.root.after(0, lambda: self._log("[INFO] Extrayendo SDK tools..."))
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(os.path.join(sdk_root, 'cmdline-tools'))
+
+        # The zip extracts to cmdline-tools/cmdline-tools, rename to 'latest'
+        extracted = os.path.join(sdk_root, 'cmdline-tools', 'cmdline-tools')
+        if os.path.isdir(extracted):
+            if os.path.isdir(cmdline_dir):
+                shutil.rmtree(cmdline_dir)
+            os.rename(extracted, cmdline_dir)
+
+        os.remove(zip_path)
+
+    def _accept_licenses_and_install(self, sdk_root, java_home):
+        """Install required SDK packages and accept licenses."""
+        sdkmanager = os.path.join(sdk_root, 'cmdline-tools', 'latest', 'bin',
+                                   'sdkmanager.bat' if sys.platform == 'win32' else 'sdkmanager')
+
+        env = os.environ.copy()
+        env['JAVA_HOME'] = java_home
+        env['ANDROID_SDK_ROOT'] = sdk_root
+
+        # Accept licenses
+        self.root.after(0, lambda: self._log("[INFO] Aceptando licencias de Android SDK..."))
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, errors='replace'
+            [sdkmanager, '--licenses', f'--sdk_root={sdk_root}'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors='replace', env=env
         )
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                self.root.after(0, lambda l=line: self._log(l))
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"Comando WSL fallo con codigo {proc.returncode}")
-
-    def _install_wsl(self):
-        """Install WSL with Ubuntu."""
-        self.root.after(0, lambda: self._log("[INFO] Instalando WSL con Ubuntu..."))
-        self.root.after(0, lambda: self._log("[INFO] Esto requiere permisos de administrador."))
-        self.root.after(0, lambda: self._log("[INFO] Si aparece UAC, acepta el permiso."))
+        # Send 'y' repeatedly to accept all licenses
         try:
-            proc = subprocess.Popen(
-                ["powershell", "-Command",
-                 "Start-Process wsl -ArgumentList '--install --distribution Ubuntu' -Verb RunAs -Wait"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, errors='replace'
-            )
-            for line in proc.stdout:
-                line = line.rstrip()
-                if line:
-                    self.root.after(0, lambda l=line: self._log(l))
-            proc.wait()
-        except Exception as e:
-            raise RuntimeError(f"No se pudo instalar WSL: {e}")
+            out, _ = proc.communicate(input='y\n' * 20, timeout=120)
+            for line in out.split('\n'):
+                if line.strip():
+                    self.root.after(0, lambda l=line.strip(): self._log(l))
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
-        # Verify
-        import time
-        time.sleep(3)
-        distro = self._check_wsl()
-        if not distro:
-            raise RuntimeError(
-                "WSL se instalo pero necesita reiniciar el equipo.\n"
-                "Reinicia Windows y vuelve a intentar la compilacion Android."
-            )
-        return distro
-
-    def _setup_wsl_buildozer(self):
-        """Install buildozer and dependencies inside WSL."""
-        self.root.after(0, lambda: self._log("[INFO] Configurando entorno buildozer en WSL..."))
-
-        setup_script = """
-set -e
-export DEBIAN_FRONTEND=noninteractive
-
-# Update and install system dependencies
-sudo apt-get update -qq
-sudo apt-get install -y -qq python3 python3-pip python3-venv \\
-    build-essential git zip unzip openjdk-17-jdk \\
-    autoconf automake libtool pkg-config \\
-    libffi-dev libssl-dev \\
-    cmake \\
-    zlib1g-dev libncurses5-dev libncursesw5-dev \\
-    2>/dev/null
-
-# Install buildozer and cython
-pip3 install --user --break-system-packages buildozer cython 2>/dev/null || \\
-pip3 install --user buildozer cython
-
-echo "SETUP_COMPLETE"
-"""
-        self._run_wsl_cmd(setup_script)
+        # Install platform, build-tools, and platform-tools
+        packages = ['platform-tools', 'platforms;android-35', 'build-tools;35.0.1']
+        for pkg in packages:
+            self.root.after(0, lambda p=pkg: self._log(f"[INFO] Instalando {p}..."))
+            self._run_cmd([sdkmanager, pkg, f'--sdk_root={sdk_root}'], cwd=sdk_root, env=env)
 
     def _build_android(self):
         self.root.after(0, lambda: self._log("=== Compilando para Android (APK) ==="))
+        self.root.after(0, lambda: self._log("[INFO] Usando Gradle + Chaquopy (nativo, sin WSL)."))
 
         script = self.entry_script.get()
         app_name = self.app_name.get().strip()
         output = self.output_dir.get()
-        is_windows = sys.platform == 'win32'
+        pkg_name = app_name.lower().replace(' ', '_').replace('-', '_')
+        site_packages = self._get_venv_site_packages()
 
-        if is_windows:
-            self.root.after(0, lambda: self._log("[INFO] Windows detectado, se usara WSL para compilar."))
+        # 1. Find JDK
+        java_home = self._find_java_home()
+        if not java_home:
+            raise RuntimeError("No se encontro JDK. Instala JDK 17+ desde https://adoptium.net/")
+        self.root.after(0, lambda: self._log(f"[INFO] JAVA_HOME: {java_home}"))
 
-            # Check/install WSL
-            distro = self._check_wsl()
-            if not distro:
-                self.root.after(0, lambda: self._log("[INFO] WSL no encontrado. Instalando..."))
-                distro = self._install_wsl()
-            self.root.after(0, lambda: self._log(f"[INFO] Usando distro WSL: {distro}"))
+        # 2. Setup Android SDK
+        sdk_root = os.path.join(os.path.expanduser('~'), '.android-sdk')
+        self._setup_android_sdk(sdk_root)
+        self._accept_licenses_and_install(sdk_root, java_home)
+        self.root.after(0, lambda: self._log(f"[INFO] ANDROID_SDK_ROOT: {sdk_root}"))
 
-            # Check if buildozer is installed in WSL
-            r = subprocess.run(
-                ["wsl", "--", "bash", "-c", "which buildozer 2>/dev/null || echo NOTFOUND"],
-                capture_output=True, text=True, errors='replace'
-            )
-            if 'NOTFOUND' in r.stdout:
-                self._setup_wsl_buildozer()
-
-        # Create buildozer project directory
-        build_dir = os.path.join(output, f"{app_name}_android_build")
-        os.makedirs(build_dir, exist_ok=True)
-
-        # Copy the script
-        shutil.copy2(script, os.path.join(build_dir, "main.py"))
-
-        # Copy extra files
-        for fpath in self._get_extra_files():
-            shutil.copy2(fpath, os.path.join(build_dir, os.path.basename(fpath)))
-
-        # Get requirements from venv
+        # 3. Get requirements from venv
         venv_python = self._get_venv_python()
         result = subprocess.run(
             [venv_python, "-m", "pip", "freeze"],
             capture_output=True, text=True
         )
-        requirements = []
+        # --- Analyze package compatibility ---
+        skip_pkgs = {
+            'pip', 'setuptools', 'wheel', 'pyinstaller', 'pyinstaller-hooks-contrib',
+            'pywin32', 'pywin32-ctypes', 'pefile', 'altgraph', 'colorama', 'pyreadline3',
+        }
+        chaquopy_native = {
+            'cffi', 'coincurve', 'bitarray', 'cytoolz', 'greenlet', 'regex',
+            'pycryptodome', 'pycryptodomex', 'aiohttp', 'frozenlist', 'multidict',
+            'yarl', 'pynacl', 'numpy', 'cryptography', 'bcrypt', 'pillow',
+            'lxml', 'ujson', 'pyyaml', 'markupsafe', 'sqlalchemy', 'websockets',
+            'tgcrypto', 'cbor2',
+        }
+
+        compatible = []
+        incompatible = []
+        pip_reqs = []
+
         for line in result.stdout.strip().split('\n'):
-            if line and not line.startswith('#'):
-                pkg = line.split('==')[0].strip()
-                if pkg.lower() not in ('pip', 'setuptools', 'wheel', 'pyinstaller',
-                                        'pyinstaller-hooks-contrib', 'pywin32',
-                                        'pywin32-ctypes', 'pefile', 'altgraph'):
-                    requirements.append(pkg)
-
-        reqs_str = ",".join(requirements) if requirements else "kivy"
-
-        # Create buildozer.spec
-        icon = self.icon_path.get()
-        icon_line = f"icon.filename = {os.path.basename(icon)}" if icon else "# icon.filename = "
-        if icon:
-            shutil.copy2(icon, os.path.join(build_dir, os.path.basename(icon)))
-
-        pkg_name = app_name.lower().replace(' ', '_').replace('-', '_')
-        spec_content = f"""[app]
-title = {app_name}
-package.name = {pkg_name}
-package.domain = org.test
-source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,ico,env,json,txt
-version = 1.0.0
-requirements = python3,{reqs_str}
-{icon_line}
-orientation = portrait
-fullscreen = 0
-android.permissions = INTERNET
-android.api = 33
-android.minapi = 21
-android.archs = arm64-v8a
-
-[buildozer]
-log_level = 2
-warn_on_root = 0
-"""
-        spec_path = os.path.join(build_dir, "buildozer.spec")
-        with open(spec_path, 'w', newline='\n') as f:
-            f.write(spec_content)
-
-        self.root.after(0, lambda: self._log(f"[INFO] Proyecto buildozer creado en: {build_dir}"))
-        self.root.after(0, lambda: self._log("[INFO] Ejecutando buildozer android debug..."))
-        self.root.after(0, lambda: self._log("[NOTA] La primera vez tarda mucho (descarga SDK/NDK ~1GB)."))
-
-        # Run buildozer
-        if is_windows:
-            wsl_build_dir = self._wsl_path(build_dir)
-            # Convert line endings and run via WSL
-            build_script = f"""
-export PATH="$HOME/.local/bin:$PATH"
-cd '{wsl_build_dir}'
-find . -name '*.py' -exec sed -i 's/\\r$//' {{}} \\;
-sed -i 's/\\r$//' buildozer.spec
-buildozer android debug 2>&1
-"""
-            try:
-                self._run_wsl_cmd(build_script)
-            except RuntimeError:
-                bin_dir = os.path.join(build_dir, "bin")
-                if os.path.isdir(bin_dir) and any(f.endswith('.apk') for f in os.listdir(bin_dir)):
-                    self.root.after(0, lambda: self._log("[AVISO] Buildozer reporto errores pero se genero el APK."))
+            if line and not line.startswith('#') and not line.startswith('-'):
+                pkg = line.strip()
+                name = pkg.split('==')[0].split('>=')[0].split('<=')[0].strip().lower()
+                name_norm = name.replace('-', '_')
+                if name_norm in skip_pkgs or name in skip_pkgs:
+                    continue
+                compatible.append(name)
+                if name_norm in chaquopy_native or name in chaquopy_native:
+                    pip_reqs.append(f'            install "{name}"')
                 else:
-                    raise
+                    pip_reqs.append(f'            install "{pkg}"')
+
+        pip_block = '\n'.join(pip_reqs) if pip_reqs else '            install "kivy"'
+
+        # --- Pre-build compatibility check: do a dry-run pip install ---
+        self.root.after(0, lambda: self._log("[INFO] Verificando compatibilidad de paquetes con Android..."))
+
+        # Try installing requirements in a temp venv to detect failures
+        import tempfile
+        test_dir = tempfile.mkdtemp(prefix=f"{app_name}_compat_")
+        test_script = os.path.join(test_dir, "test_reqs.py")
+        with open(test_script, 'w') as f:
+            f.write("# compatibility test\n")
+
+        # We can't fully test without building, so instead we classify and warn
+        # Check which packages have .pyd/.so (C extensions) in site-packages
+        c_ext_pkgs = []
+        for name in compatible:
+            name_norm = name.replace('-', '_')
+            pkg_dir = os.path.join(site_packages, name_norm)
+            if not os.path.isdir(pkg_dir):
+                pkg_dir = os.path.join(site_packages, name)
+            if os.path.isdir(pkg_dir):
+                has_native = any(
+                    f.endswith(('.pyd', '.so', '.dll'))
+                    for f in os.listdir(pkg_dir)
+                )
+                if has_native and name_norm not in chaquopy_native and name not in chaquopy_native:
+                    incompatible.append(name)
+
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+        # --- Show compatibility report and ask for confirmation ---
+        if incompatible:
+            report = (
+                f"Se detectaron {len(incompatible)} paquete(s) con extensiones nativas "
+                f"que podrian no funcionar en Android:\n\n"
+            )
+            for pkg in incompatible:
+                report += f"  - {pkg}\n"
+            report += (
+                f"\n{len(compatible) - len(incompatible)} de {len(compatible)} paquetes son compatibles.\n\n"
+                "Las funciones que dependan de estos paquetes no van a funcionar en la app Android.\n"
+                "El resto de la app funcionara normalmente.\n\n"
+                "Deseas continuar con la compilacion?"
+            )
+
+            proceed = threading.Event()
+            user_choice = [False]
+
+            def _ask():
+                user_choice[0] = messagebox.askyesno(
+                    "Compatibilidad Android",
+                    report
+                )
+                proceed.set()
+
+            self.root.after(0, _ask)
+            proceed.wait()
+
+            if not user_choice[0]:
+                self.root.after(0, lambda: self._log("[INFO] Compilacion cancelada por el usuario."))
+                return
+
+            # Remove incompatible packages from requirements
+            pip_reqs_filtered = []
+            for req_line in pip_reqs:
+                pkg_in_line = req_line.strip().replace('install "', '').rstrip('"')
+                pkg_name_check = pkg_in_line.split('==')[0].split('>=')[0].strip().lower().replace('-', '_')
+                if pkg_name_check not in [p.replace('-', '_') for p in incompatible]:
+                    pip_reqs_filtered.append(req_line)
+                else:
+                    self.root.after(0, lambda p=pkg_in_line: self._log(f"[AVISO] Omitido (sin soporte Android): {p}"))
+            pip_reqs = pip_reqs_filtered
+            pip_block = '\n'.join(pip_reqs) if pip_reqs else '            install "kivy"'
         else:
-            # Linux/macOS native
-            try:
-                self._run_cmd(["buildozer", "android", "debug"], cwd=build_dir)
-            except RuntimeError:
-                bin_dir = os.path.join(build_dir, "bin")
-                if os.path.isdir(bin_dir) and any(f.endswith('.apk') for f in os.listdir(bin_dir)):
-                    self.root.after(0, lambda: self._log("[AVISO] Buildozer reporto errores pero se genero el APK."))
-                else:
-                    raise
+            self.root.after(0, lambda: self._log(
+                f"[OK] Todos los {len(compatible)} paquetes son compatibles con Android."))
 
-        # Move APK to output
-        bin_dir = os.path.join(build_dir, "bin")
+        # 4. Create Gradle + Chaquopy project
+        build_dir = os.path.join(output, f"{app_name}_android_build")
+        if os.path.isdir(build_dir):
+            shutil.rmtree(build_dir)
+
+        app_dir = os.path.join(build_dir, 'app')
+        src_dir = os.path.join(app_dir, 'src', 'main')
+        python_dir = os.path.join(src_dir, 'python')
+        res_dir = os.path.join(src_dir, 'res')
+        os.makedirs(python_dir, exist_ok=True)
+        os.makedirs(os.path.join(res_dir, 'mipmap-xxxhdpi'), exist_ok=True)
+        os.makedirs(os.path.join(res_dir, 'values'), exist_ok=True)
+
+        # Copy Python script
+        shutil.copy2(script, os.path.join(python_dir, 'main.py'))
+
+        # Copy extra files
+        for fpath in self._get_extra_files():
+            shutil.copy2(fpath, os.path.join(python_dir, os.path.basename(fpath)))
+
+        # Copy icon
+        icon = self.icon_path.get()
+        if icon and os.path.isfile(icon):
+            try:
+                from PIL import Image
+                img = Image.open(icon)
+                for size, folder in [(192, 'mipmap-xxxhdpi'), (144, 'mipmap-xxhdpi'),
+                                      (96, 'mipmap-xhdpi'), (72, 'mipmap-hdpi'), (48, 'mipmap-mdpi')]:
+                    d = os.path.join(res_dir, folder)
+                    os.makedirs(d, exist_ok=True)
+                    img.resize((size, size), Image.LANCZOS).save(os.path.join(d, 'ic_launcher.png'))
+            except Exception:
+                shutil.copy2(icon, os.path.join(res_dir, 'mipmap-xxxhdpi', 'ic_launcher.png'))
+
+        # settings.gradle
+        with open(os.path.join(build_dir, 'settings.gradle'), 'w', newline='\n') as f:
+            f.write(f"""pluginManagement {{
+    repositories {{
+        google()
+        mavenCentral()
+        maven {{ url "https://chaquo.com/maven" }}
+    }}
+}}
+dependencyResolutionManagement {{
+    repositories {{
+        google()
+        mavenCentral()
+        maven {{ url "https://chaquo.com/maven" }}
+    }}
+}}
+rootProject.name = "{app_name}"
+include ':app'
+""")
+
+        # Top-level build.gradle
+        with open(os.path.join(build_dir, 'build.gradle'), 'w', newline='\n') as f:
+            f.write("""plugins {
+    id 'com.android.application' version '8.7.0' apply false
+    id 'com.chaquo.python' version '16.1.0' apply false
+}
+""")
+
+        # gradle.properties
+        with open(os.path.join(build_dir, 'gradle.properties'), 'w', newline='\n') as f:
+            f.write("""android.useAndroidX=true
+org.gradle.jvmargs=-Xmx2048m
+""")
+
+        # app/build.gradle
+        with open(os.path.join(app_dir, 'build.gradle'), 'w', newline='\n') as f:
+            f.write(f"""plugins {{
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}}
+
+android {{
+    namespace 'org.test.{pkg_name}'
+    compileSdk 35
+
+    defaultConfig {{
+        applicationId "org.test.{pkg_name}"
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName "1.0"
+
+        ndk {{
+            abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+        }}
+
+        python {{
+            version "3.11"
+            pip {{
+{pip_block}
+            }}
+        }}
+    }}
+
+    buildTypes {{
+        release {{
+            minifyEnabled false
+        }}
+    }}
+}}
+""")
+
+        # AndroidManifest.xml
+        os.makedirs(os.path.dirname(os.path.join(src_dir, 'AndroidManifest.xml')), exist_ok=True)
+        with open(os.path.join(src_dir, 'AndroidManifest.xml'), 'w', newline='\n') as f:
+            f.write(f"""<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="{app_name}"
+        android:theme="@style/AppTheme">
+        <activity
+            android:name="com.chaquo.python.android.PyApplication"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+""")
+
+        # styles.xml
+        with open(os.path.join(res_dir, 'values', 'styles.xml'), 'w', newline='\n') as f:
+            f.write("""<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
+""")
+
+        # Gradle wrapper
+        wrapper_dir = os.path.join(build_dir, 'gradle', 'wrapper')
+        os.makedirs(wrapper_dir, exist_ok=True)
+        with open(os.path.join(wrapper_dir, 'gradle-wrapper.properties'), 'w', newline='\n') as f:
+            f.write("""distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-8.9-bin.zip
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+""")
+
+        # Download gradle wrapper jar and script
+        self.root.after(0, lambda: self._log("[INFO] Configurando Gradle wrapper..."))
+        gradlew = os.path.join(build_dir, 'gradlew.bat' if sys.platform == 'win32' else 'gradlew')
+        if sys.platform == 'win32':
+            with open(gradlew, 'w', newline='\r\n') as f:
+                f.write("""@rem Gradle wrapper
+@echo off
+set DIRNAME=%~dp0
+set JAVA_EXE=java.exe
+if defined JAVA_HOME set JAVA_EXE=%JAVA_HOME%\\bin\\java.exe
+set CLASSPATH=%DIRNAME%\\gradle\\wrapper\\gradle-wrapper.jar
+"%JAVA_EXE%" %JAVA_OPTS% -classpath "%CLASSPATH%" org.gradle.wrapper.GradleWrapperMain %*
+""")
+        else:
+            with open(gradlew, 'w', newline='\n') as f:
+                f.write("""#!/bin/sh
+DIRNAME=$(cd "$(dirname "$0")" && pwd)
+JAVA_EXE=java
+[ -n "$JAVA_HOME" ] && JAVA_EXE="$JAVA_HOME/bin/java"
+CLASSPATH="$DIRNAME/gradle/wrapper/gradle-wrapper.jar"
+exec "$JAVA_EXE" $JAVA_OPTS -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
+""")
+            os.chmod(gradlew, 0o755)
+
+        # Download gradle-wrapper.jar
+        wrapper_jar = os.path.join(wrapper_dir, 'gradle-wrapper.jar')
+        if not os.path.isfile(wrapper_jar):
+            import urllib.request
+            self.root.after(0, lambda: self._log("[INFO] Descargando gradle-wrapper.jar..."))
+            urllib.request.urlretrieve(
+                "https://raw.githubusercontent.com/gradle/gradle/v8.9.0/gradle/wrapper/gradle-wrapper.jar",
+                wrapper_jar
+            )
+
+        # 5. Build APK
+        self.root.after(0, lambda: self._log("[INFO] Compilando APK con Gradle + Chaquopy..."))
+        self.root.after(0, lambda: self._log("[NOTA] La primera vez descarga dependencias (~500MB)."))
+
+        env = os.environ.copy()
+        env['JAVA_HOME'] = java_home
+        env['ANDROID_SDK_ROOT'] = sdk_root
+        env['ANDROID_HOME'] = sdk_root
+
+        self._run_cmd([gradlew, 'assembleDebug', '--stacktrace'], cwd=build_dir, env=env)
+
+        # 6. Find and copy APK
         apk_found = False
-        if os.path.isdir(bin_dir):
-            for f in os.listdir(bin_dir):
+        apk_search = os.path.join(app_dir, 'build', 'outputs', 'apk', 'debug')
+        if os.path.isdir(apk_search):
+            for f in os.listdir(apk_search):
                 if f.endswith('.apk'):
-                    src = os.path.join(bin_dir, f)
-                    dst = os.path.join(output, f)
+                    src = os.path.join(apk_search, f)
+                    dst = os.path.join(output, f"{app_name}.apk")
                     shutil.copy2(src, dst)
                     self.root.after(0, lambda d=dst: self._log(f"[OK] APK copiado a: {d}"))
                     apk_found = True
+                    break
 
         if apk_found:
             self.root.after(0, lambda: self._log(f"\n[OK] APK Android generado en: {output}"))
