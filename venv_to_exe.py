@@ -23,6 +23,7 @@ import os, sys, atexit, signal, threading, traceback, datetime
 
 _APP_NAME = $app_name_repr
 _PLATFORM = $platform_repr
+_ALLOW_MULTIPLE = $allow_multiple_repr
 
 # --- 0. Prevent duplicate execution (PyInstaller --onefile spawns child process) ---
 import multiprocessing
@@ -100,15 +101,15 @@ def _remove_lock():
     except Exception:
         pass
 
-if _is_already_running():
-    _log_error('Another instance is already running. Exiting.')
-    sys.exit(0)
-
-_write_lock()
-atexit.register(_remove_lock)
+if not _ALLOW_MULTIPLE:
+    if _is_already_running():
+        sys.exit(0)
+    _write_lock()
+    atexit.register(_remove_lock)
 
 def _signal_handler(signum, frame):
-    _remove_lock()
+    if not _ALLOW_MULTIPLE:
+        _remove_lock()
     sys.exit(0)
 
 for _sig in (signal.SIGTERM, signal.SIGINT):
@@ -250,6 +251,7 @@ class VenvToExeApp:
         self.autostart = tk.BooleanVar(value=True)
         self.onefile = tk.BooleanVar(value=True)
         self.noconsole = tk.BooleanVar(value=True)
+        self.allow_multiple = tk.BooleanVar(value=False)
         self.extra_files = tk.StringVar()
 
         self._build_ui()
@@ -319,6 +321,9 @@ class VenvToExeApp:
 
         ttk.Checkbutton(opt_frame, text="Un solo archivo", variable=self.onefile).pack(side=tk.LEFT, padx=10)
         ttk.Checkbutton(opt_frame, text="Sin consola (background)", variable=self.noconsole).pack(side=tk.LEFT, padx=10)
+        self.multi_check = ttk.Checkbutton(opt_frame, text="Permitir multiples instancias",
+                                            variable=self.allow_multiple)
+        self.multi_check.pack(side=tk.LEFT, padx=10)
 
         # --- Extra files (.env, configs, data) ---
         row = ttk.Frame(main)
@@ -484,6 +489,7 @@ class VenvToExeApp:
         wrapper = AUTOSTART_WRAPPER.substitute(
             app_name_repr=repr(app_name),
             platform_repr=repr(plat),
+            allow_multiple_repr=repr(self.allow_multiple.get()),
         )
 
         temp_dir = os.path.join(self.output_dir.get(), "_temp_build")
@@ -887,13 +893,39 @@ class VenvToExeApp:
             'pip', 'setuptools', 'wheel', 'pyinstaller', 'pyinstaller-hooks-contrib',
             'pywin32', 'pywin32-ctypes', 'pefile', 'altgraph', 'colorama', 'pyreadline3',
         }
-        chaquopy_native = {
-            'cffi', 'coincurve', 'bitarray', 'cytoolz', 'greenlet', 'regex',
-            'pycryptodome', 'pycryptodomex', 'aiohttp', 'frozenlist', 'multidict',
-            'yarl', 'pynacl', 'numpy', 'cryptography', 'bcrypt', 'pillow',
-            'lxml', 'ujson', 'pyyaml', 'markupsafe', 'sqlalchemy', 'websockets',
-            'tgcrypto', 'cbor2',
+        # Chaquopy official pre-built wheels (from https://chaquo.com/pypi-13.1/)
+        chaquopy_wheels = {
+            'aiohttp', 'argon2_cffi_bindings', 'argon2_cffi', 'astropy', 'aubio',
+            'bcrypt', 'bitarray', 'blis', 'brotli', 'cffi', 'coincurve',
+            'contourpy', 'cryptography', 'cvxopt', 'cymem', 'cytoolz',
+            'editdistance', 'ephem', 'frozenlist', 'gensim', 'gevent',
+            'google_crc32c', 'greenlet', 'grpcio', 'h5py', 'igraph',
+            'kiwisolver', 'lameenc', 'llvmlite', 'lru_dict', 'lxml', 'lz4',
+            'marisa_trie', 'markupsafe', 'matplotlib', 'multidict',
+            'murmurhash', 'netifaces', 'numba', 'numpy',
+            'opencv_python', 'opencv_python_headless',
+            'opencv_contrib_python', 'opencv_contrib_python_headless',
+            'pandas', 'pillow', 'preshed', 'psutil', 'pycares',
+            'pycrypto', 'pycryptodome', 'pycryptodomex', 'pycurl',
+            'pynacl', 'pyproj', 'pysha3', 'pywavelets', 'pyyaml',
+            'pyzbar', 'pyzmq', 'rawpy', 'regex', 'ruamel_yaml_clib',
+            'scikit_image', 'scikit_learn', 'scipy', 'sentencepiece',
+            'shapely', 'soxr', 'spacy', 'srsly', 'statsmodels',
+            'tensorflow', 'tflite_runtime', 'tgcrypto', 'thinc',
+            'tokenizers', 'torch', 'torchvision', 'tornado', 'twisted',
+            'typed_ast', 'ujson', 'wordcloud', 'xgboost', 'yarl',
+            'zope_interface', 'zstandard', 'sqlalchemy', 'cbor2',
         }
+        # Packages with optional C extensions that have pure-Python fallbacks
+        # They ship .pyd on Windows but work without native code on Android
+        pure_python_fallback = {
+            'charset_normalizer', 'propcache', 'websockets', 'pydantic_core',
+            'rpds_py', 'jiter', 'msgpack', 'wrapt', 'simplejson', 'orjson',
+            'multiprocess', 'httptools', 'uvloop', 'cchardet', 'crcmod',
+            'greenlet', 'markupsafe',
+        }
+
+        self.root.after(0, lambda: self._log("[INFO] Verificando compatibilidad de paquetes con Android..."))
 
         compatible = []
         incompatible = []
@@ -906,65 +938,70 @@ class VenvToExeApp:
                 name_norm = name.replace('-', '_')
                 if name_norm in skip_pkgs or name in skip_pkgs:
                     continue
-                compatible.append(name)
-                if name_norm in chaquopy_native or name in chaquopy_native:
-                    pip_reqs.append(f'            install "{name}"')
+
+                # Check if this package needs native compilation
+                needs_native = False
+                pkg_dir = os.path.join(site_packages, name_norm)
+                if not os.path.isdir(pkg_dir):
+                    pkg_dir = os.path.join(site_packages, name)
+                if os.path.isdir(pkg_dir):
+                    needs_native = any(
+                        f.endswith(('.pyd', '.so', '.dll'))
+                        for f in os.listdir(pkg_dir)
+                    )
+                # Also check dist-info for build system (maturin = Rust)
+                for d in os.listdir(site_packages):
+                    if d.startswith(name_norm) and d.endswith('.dist-info'):
+                        meta_path = os.path.join(site_packages, d, 'METADATA')
+                        if os.path.isfile(meta_path):
+                            try:
+                                with open(meta_path, 'r', encoding='utf-8', errors='ignore') as mf:
+                                    meta = mf.read(2000)
+                                if 'maturin' in meta.lower() or 'rust' in meta.lower():
+                                    needs_native = True
+                            except Exception:
+                                pass
+                        break
+
+                if needs_native:
+                    if name_norm in chaquopy_wheels or name in chaquopy_wheels:
+                        # Chaquopy has a wheel - use unversioned so it picks its own
+                        compatible.append(name)
+                        pip_reqs.append(f'            install "{name}"')
+                    elif name_norm in pure_python_fallback or name in pure_python_fallback:
+                        # Has pure-Python fallback - install with version pin
+                        compatible.append(name)
+                        pip_reqs.append(f'            install "{pkg}"')
+                    else:
+                        # No wheel available - incompatible
+                        incompatible.append(name)
                 else:
+                    # Pure Python - always works
+                    compatible.append(name)
                     pip_reqs.append(f'            install "{pkg}"')
 
         pip_block = '\n'.join(pip_reqs) if pip_reqs else '            install "kivy"'
 
-        # --- Pre-build compatibility check: do a dry-run pip install ---
-        self.root.after(0, lambda: self._log("[INFO] Verificando compatibilidad de paquetes con Android..."))
-
-        # Try installing requirements in a temp venv to detect failures
-        import tempfile
-        test_dir = tempfile.mkdtemp(prefix=f"{app_name}_compat_")
-        test_script = os.path.join(test_dir, "test_reqs.py")
-        with open(test_script, 'w') as f:
-            f.write("# compatibility test\n")
-
-        # We can't fully test without building, so instead we classify and warn
-        # Check which packages have .pyd/.so (C extensions) in site-packages
-        c_ext_pkgs = []
-        for name in compatible:
-            name_norm = name.replace('-', '_')
-            pkg_dir = os.path.join(site_packages, name_norm)
-            if not os.path.isdir(pkg_dir):
-                pkg_dir = os.path.join(site_packages, name)
-            if os.path.isdir(pkg_dir):
-                has_native = any(
-                    f.endswith(('.pyd', '.so', '.dll'))
-                    for f in os.listdir(pkg_dir)
-                )
-                if has_native and name_norm not in chaquopy_native and name not in chaquopy_native:
-                    incompatible.append(name)
-
-        shutil.rmtree(test_dir, ignore_errors=True)
-
         # --- Show compatibility report and ask for confirmation ---
         if incompatible:
             report = (
-                f"Se detectaron {len(incompatible)} paquete(s) con extensiones nativas "
-                f"que podrian no funcionar en Android:\n\n"
+                f"Se detectaron {len(incompatible)} paquete(s) con codigo nativo (C/Rust) "
+                f"que NO tienen wheel pre-compilado para Android:\n\n"
             )
             for pkg in incompatible:
                 report += f"  - {pkg}\n"
             report += (
-                f"\n{len(compatible) - len(incompatible)} de {len(compatible)} paquetes son compatibles.\n\n"
-                "Las funciones que dependan de estos paquetes no van a funcionar en la app Android.\n"
-                "El resto de la app funcionara normalmente.\n\n"
-                "Deseas continuar con la compilacion?"
+                f"\n{len(compatible)} de {len(compatible) + len(incompatible)} paquetes SI son compatibles.\n\n"
+                "Estos paquetes seran OMITIDOS del APK.\n"
+                "Las funciones que dependan de ellos no van a funcionar.\n\n"
+                "Deseas continuar?"
             )
 
             proceed = threading.Event()
             user_choice = [False]
 
             def _ask():
-                user_choice[0] = messagebox.askyesno(
-                    "Compatibilidad Android",
-                    report
-                )
+                user_choice[0] = messagebox.askyesno("Compatibilidad Android", report)
                 proceed.set()
 
             self.root.after(0, _ask)
@@ -974,17 +1011,8 @@ class VenvToExeApp:
                 self.root.after(0, lambda: self._log("[INFO] Compilacion cancelada por el usuario."))
                 return
 
-            # Remove incompatible packages from requirements
-            pip_reqs_filtered = []
-            for req_line in pip_reqs:
-                pkg_in_line = req_line.strip().replace('install "', '').rstrip('"')
-                pkg_name_check = pkg_in_line.split('==')[0].split('>=')[0].strip().lower().replace('-', '_')
-                if pkg_name_check not in [p.replace('-', '_') for p in incompatible]:
-                    pip_reqs_filtered.append(req_line)
-                else:
-                    self.root.after(0, lambda p=pkg_in_line: self._log(f"[AVISO] Omitido (sin soporte Android): {p}"))
-            pip_reqs = pip_reqs_filtered
-            pip_block = '\n'.join(pip_reqs) if pip_reqs else '            install "kivy"'
+            for p in incompatible:
+                self.root.after(0, lambda p=p: self._log(f"[AVISO] Omitido (sin wheel Android): {p}"))
         else:
             self.root.after(0, lambda: self._log(
                 f"[OK] Todos los {len(compatible)} paquetes son compatibles con Android."))
@@ -1004,6 +1032,34 @@ class VenvToExeApp:
 
         # Copy Python script
         shutil.copy2(script, os.path.join(python_dir, 'main.py'))
+
+        # Create stub modules for incompatible packages so imports don't crash
+        if incompatible:
+            stubs_dir = os.path.join(python_dir, '_stubs')
+            os.makedirs(stubs_dir, exist_ok=True)
+            # Create a sitecustomize.py that adds stubs to sys.path
+            sitecust = os.path.join(python_dir, 'sitecustomize.py')
+            with open(sitecust, 'w', newline='\n') as f:
+                f.write("import sys, os\n")
+                f.write("sys.path.insert(0, os.path.join(os.path.dirname(__file__), '_stubs'))\n")
+
+            for pkg_name in incompatible:
+                stub_name = pkg_name.replace('-', '_')
+                stub_file = os.path.join(stubs_dir, stub_name + '.py')
+                with open(stub_file, 'w', newline='\n') as f:
+                    f.write(f'"""Stub for {pkg_name} (not available on Android)."""\n')
+                    f.write(f'raise ImportError("{pkg_name} is not available on Android")\n')
+                # For packages like py-sr25519-bindings that import as 'sr25519'
+                if stub_name == 'py_sr25519_bindings':
+                    sr_stub = os.path.join(stubs_dir, 'sr25519.py')
+                    with open(sr_stub, 'w', newline='\n') as f:
+                        f.write('"""Stub for sr25519 (py-sr25519-bindings not available on Android)."""\n')
+                        f.write('def pair_from_seed(*a, **kw): raise NotImplementedError("sr25519 not available on Android")\n')
+                        f.write('def public_from_secret_key(*a, **kw): raise NotImplementedError("sr25519 not available on Android")\n')
+                        f.write('def hard_derive_keypair(*a, **kw): raise NotImplementedError("sr25519 not available on Android")\n')
+                        f.write('def derive_keypair(*a, **kw): raise NotImplementedError("sr25519 not available on Android")\n')
+                        f.write('def derive_pubkey(*a, **kw): raise NotImplementedError("sr25519 not available on Android")\n')
+                self.root.after(0, lambda s=stub_name: self._log(f"[INFO] Stub creado para: {s}"))
 
         # Copy extra files
         for fpath in self._get_extra_files():
@@ -1082,6 +1138,7 @@ android {{
         python {{
             version "3.11"
             pip {{
+                options "--prefer-binary"
 {pip_block}
             }}
         }}
