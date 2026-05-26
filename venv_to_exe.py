@@ -571,9 +571,15 @@ class VenvToExeApp:
 
     def _run_cmd(self, cmd, cwd=None, env=None):
         self.root.after(0, lambda: self._log(f"$ {' '.join(cmd)}"))
+        startupinfo = None
+        if sys.platform == 'win32':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=cwd, env=env, text=True, errors='replace'
+            cwd=cwd, env=env, text=True, errors='replace',
+            startupinfo=startupinfo,
         )
         for line in proc.stdout:
             line = line.rstrip()
@@ -772,6 +778,7 @@ class VenvToExeApp:
         output = self.output_dir.get()
         pkg_name = app_name.lower().replace(' ', '_').replace('-', '_')
         import time as _time
+        repo_suffix = str(int(_time.time()))[-6:]
 
         # 1. Check gh CLI
         self.root.after(0, lambda: self._log("[INFO] Verificando GitHub CLI..."))
@@ -792,8 +799,9 @@ class VenvToExeApp:
         # 2. Get requirements
         venv_python = self._get_venv_python()
         result = subprocess.run([venv_python, "-m", "pip", "freeze"], capture_output=True, text=True)
-        skip_pkgs = {'pip', 'setuptools', 'wheel', 'pyinstaller', 'pyinstaller-hooks-contrib',
-                      'pywin32', 'pywin32-ctypes', 'pefile', 'altgraph'}
+        skip_pkgs = {'pip', 'setuptools', 'wheel', 'pyinstaller', 'pyinstaller_hooks_contrib',
+                      'pywin32', 'pywin32_ctypes', 'pefile', 'altgraph', 'colorama',
+                      'pyreadline3', 'pywin32'}
         reqs = []
         for line in result.stdout.strip().split('\n'):
             if line and not line.startswith('#'):
@@ -865,17 +873,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential git zip unzip \\
-            openjdk-17-jdk autoconf automake libtool pkg-config \\
-            libffi-dev libssl-dev cmake zlib1g-dev ccache
-          pip install buildozer cython
+            openjdk-17-jdk autoconf automake libtool libltdl-dev pkg-config \\
+            libffi-dev libssl-dev cmake zlib1g-dev ccache \\
+            lld
+      - name: Install buildozer
+        run: pip install buildozer cython
       - name: Build APK
-        run: |
-          yes | buildozer android debug 2>&1 | tail -200
+        run: yes | buildozer android debug
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: APK
           path: bin/*.apk
@@ -887,7 +897,7 @@ jobs:
             f.write(".buildozer/\nbin/\n__pycache__/\n*.pyc\n")
 
         # 4. Create private GitHub repo and push
-        repo_name = f"_build-{pkg_name}-apk"
+        repo_name = f"_build-{pkg_name}-{repo_suffix}"
         self.root.after(0, lambda: self._log(f"[INFO] Creando repo temporal: {repo_name}"))
 
         # Delete repo if it already exists from a previous build
