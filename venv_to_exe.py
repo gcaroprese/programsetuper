@@ -23,6 +23,316 @@ SETTINGS_DIR = os.path.join(os.path.expanduser('~'), '.venv_to_exe')
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, 'settings.json')
 
 
+# ============================================================ Auto-detection helpers
+# Pure functions (no Tk) so they are unit-testable.
+
+def _venv_python_for(venv_dir):
+    """Return the python binary path inside a venv, or None if not found."""
+    if sys.platform == 'win32':
+        py = os.path.join(venv_dir, "Scripts", "python.exe")
+    else:
+        py = os.path.join(venv_dir, "bin", "python")
+    return py if os.path.isfile(py) else None
+
+
+def _is_valid_venv(path):
+    """True if path looks like a valid venv (has pyvenv.cfg + python binary)."""
+    return os.path.isfile(os.path.join(path, 'pyvenv.cfg')) and _venv_python_for(path) is not None
+
+
+def _detect_project_root(script_dir):
+    """Walk up from script_dir (max 4 levels) to find a project root."""
+    markers = {'.git', 'pyproject.toml', 'setup.py', 'setup.cfg',
+               'requirements.txt', 'Pipfile', 'poetry.lock'}
+    home = os.path.expanduser('~')
+    current = os.path.abspath(script_dir)
+    for _ in range(5):  # script_dir itself + 4 parents
+        for m in markers:
+            if os.path.exists(os.path.join(current, m)):
+                return current
+        parent = os.path.dirname(current)
+        if parent == current or os.path.normcase(current) == os.path.normcase(home):
+            break
+        current = parent
+    return os.path.abspath(script_dir)
+
+
+def _detect_venv(script_dir, project_root):
+    """Find the best venv directory.  Returns (path, [alternatives]) or (None, [])."""
+    preferred_names = ['.venv', 'venv', 'env', '.env', 'virtualenv']
+    candidates = []
+
+    # Check preferred names in script_dir and project_root
+    search_dirs = list(dict.fromkeys([script_dir, project_root]))
+    for base in search_dirs:
+        for name in preferred_names:
+            p = os.path.join(base, name)
+            if os.path.isdir(p) and _is_valid_venv(p):
+                candidates.append(p)
+
+    # Scan direct children of project_root for pyvenv.cfg (max 30)
+    seen = {os.path.normcase(c) for c in candidates}
+    try:
+        children = os.listdir(project_root)
+    except OSError:
+        children = []
+    scanned = 0
+    for child in children:
+        if scanned >= 30:
+            break
+        if child.startswith('.') and child.lower() not in ('.venv', '.env'):
+            continue
+        p = os.path.join(project_root, child)
+        if not os.path.isdir(p):
+            continue
+        scanned += 1
+        if os.path.normcase(p) not in seen and _is_valid_venv(p):
+            candidates.append(p)
+
+    # VIRTUAL_ENV env var
+    env_venv = os.environ.get('VIRTUAL_ENV')
+    if env_venv and os.path.isdir(env_venv) and _is_valid_venv(env_venv):
+        nc = os.path.normcase(env_venv)
+        if nc not in {os.path.normcase(c) for c in candidates}:
+            candidates.append(env_venv)
+
+    if not candidates:
+        return None, []
+
+    # Rank: prefer .venv > venv > others; prefer matching Python version
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+
+    def _rank(p):
+        name = os.path.basename(p).lower()
+        name_score = {'.venv': 4, 'venv': 3, 'env': 2}.get(name, 1)
+        ver_score = 0
+        cfg = os.path.join(p, 'pyvenv.cfg')
+        try:
+            with open(cfg, 'r') as f:
+                for line in f:
+                    if line.lower().startswith('version'):
+                        if py_ver in line:
+                            ver_score = 10
+                        break
+        except OSError:
+            pass
+        return (ver_score, name_score)
+
+    candidates.sort(key=_rank, reverse=True)
+    return candidates[0], candidates[1:]
+
+
+def _detect_icon(script_dir, project_root, app_name, script_stem):
+    """Find the best icon file.  Returns path or None."""
+    icon_exts = {'.ico', '.icns', '.png'}
+    asset_dirs = {'assets', 'static', 'img', 'images', 'icons', 'resources', 'res'}
+    files = []
+    scanned = 0
+    max_files = 200
+
+    # Collect candidates from script_dir, project_root, and asset subdirs
+    search_dirs = list(dict.fromkeys([script_dir, project_root]))
+    scan_dirs = list(search_dirs)
+    for base in search_dirs:
+        try:
+            for child in os.listdir(base):
+                if child.lower() in asset_dirs:
+                    p = os.path.join(base, child)
+                    if os.path.isdir(p):
+                        scan_dirs.append(p)
+        except OSError:
+            pass
+
+    for d in scan_dirs:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            if scanned >= max_files:
+                break
+            fp = os.path.join(d, entry)
+            if not os.path.isfile(fp):
+                continue
+            ext = os.path.splitext(entry)[1].lower()
+            if ext in icon_exts:
+                files.append(fp)
+            scanned += 1
+        if scanned >= max_files:
+            break
+
+    if not files:
+        return None
+
+    # Normalize names for comparison
+    def _normalize(s):
+        return s.lower().replace('-', '').replace('_', '').replace(' ', '')
+
+    norm_app = _normalize(app_name)
+    norm_stem = _normalize(script_stem)
+
+    def _score(fp):
+        fname = os.path.splitext(os.path.basename(fp))[0]
+        norm_fname = _normalize(fname)
+        ext = os.path.splitext(fp)[1].lower()
+        parent = os.path.basename(os.path.dirname(fp)).lower()
+        s = 0
+        if norm_fname == norm_app or norm_fname == norm_stem:
+            s += 50
+        if any(kw in norm_fname for kw in ('icon', 'logo', 'app')):
+            s += 30
+        if (ext == '.ico' and sys.platform == 'win32') or (ext == '.icns' and sys.platform == 'darwin'):
+            s += 20
+        elif ext == '.png':
+            s += 10
+        if parent in asset_dirs:
+            s += 10
+        # PNG bonus: square and >= 128px
+        if ext == '.png':
+            try:
+                from PIL import Image
+                with Image.open(fp) as img:
+                    w, h = img.size
+                    if w == h and w >= 128:
+                        s += 10
+            except Exception:
+                pass
+        return s
+
+    scored = [(f, _score(f)) for f in files]
+    scored.sort(key=lambda x: (-x[1], -os.path.getsize(x[0])))
+    best_path, best_score = scored[0]
+    if best_score < 30:
+        return None
+    return best_path
+
+
+def _detect_output_dir(project_root):
+    """Propose an output directory."""
+    return os.path.join(project_root, 'dist')
+
+
+def _detect_extra_files(script_dir, project_root, source_text):
+    """Find config/env files referenced by the script source."""
+    config_names = {'.env', 'config.json', 'config.yaml', 'config.yml',
+                    'config.ini', 'settings.json', 'settings.ini'}
+    found = []
+    search_dirs = list(dict.fromkeys([script_dir, project_root]))
+    src_lower = source_text.lower()
+    has_dotenv = 'load_dotenv' in source_text or 'from dotenv' in source_text or 'import dotenv' in source_text
+
+    for d in search_dirs:
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for entry in entries:
+            fp = os.path.join(d, entry)
+            if not os.path.isfile(fp):
+                continue
+            name_lower = entry.lower()
+            is_env_file = name_lower == '.env' or name_lower.endswith('.env')
+            is_config = name_lower in config_names or is_env_file
+            if not is_config:
+                continue
+            # Check if referenced in source
+            if is_env_file and has_dotenv:
+                found.append(fp)
+            elif f"'{entry}'" in source_text or f'"{entry}"' in source_text:
+                found.append(fp)
+
+    # Deduplicate by normcase
+    seen = set()
+    unique = []
+    for fp in found:
+        nc = os.path.normcase(fp)
+        if nc not in seen:
+            seen.add(nc)
+            unique.append(fp)
+    return unique
+
+
+def _detect_app_name(script_path, project_root):
+    """Detect app name from pyproject.toml, setup.py/cfg, or script stem."""
+    # 1. pyproject.toml
+    toml_path = os.path.join(project_root, 'pyproject.toml')
+    if os.path.isfile(toml_path):
+        name = _parse_name_from_toml(toml_path)
+        if name:
+            return name
+
+    # 2. setup.cfg
+    setup_cfg = os.path.join(project_root, 'setup.cfg')
+    if os.path.isfile(setup_cfg):
+        try:
+            import re
+            with open(setup_cfg, 'r', encoding='utf-8') as f:
+                in_metadata = False
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith('['):
+                        in_metadata = stripped.lower() == '[metadata]'
+                        continue
+                    if in_metadata:
+                        m = re.match(r'^name\s*=\s*(.+)', stripped)
+                        if m:
+                            return m.group(1).strip()
+        except Exception:
+            pass
+
+    # 3. setup.py (best-effort regex)
+    setup_py = os.path.join(project_root, 'setup.py')
+    if os.path.isfile(setup_py):
+        try:
+            import re
+            with open(setup_py, 'r', encoding='utf-8') as f:
+                content = f.read(4096)
+            m = re.search(r'''name\s*=\s*['"]([^'"]+)['"]''', content)
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+
+    # 4. Fallback: script stem
+    stem = Path(script_path).stem.replace('_', ' ').title()
+    return stem
+
+
+def _parse_name_from_toml(toml_path):
+    """Extract project name from pyproject.toml (stdlib tomllib or regex fallback)."""
+    try:
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
+        with open(toml_path, 'rb') as f:
+            data = tomllib.load(f)
+        name = data.get('project', {}).get('name')
+        if not name:
+            name = data.get('tool', {}).get('poetry', {}).get('name')
+        if name:
+            return name.strip()
+    except Exception:
+        pass
+    # Regex fallback for Python < 3.11 without tomli
+    import re
+    try:
+        with open(toml_path, 'r', encoding='utf-8') as f:
+            content = f.read(4096)
+        section = None
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('['):
+                section = stripped
+            elif section in ('[project]', '[tool.poetry]'):
+                m = re.match(r'^\s*name\s*=\s*["\'](.+?)["\']', stripped)
+                if m:
+                    return m.group(1).strip()
+    except Exception:
+        pass
+    return None
+
+
 def _hide_windows():
     """Return startupinfo and creationflags to hide CMD windows on Windows."""
     if sys.platform == 'win32':
@@ -284,6 +594,10 @@ class VenvToExeApp:
         self._log_buffer = []
         self._log_flush_pending = False
 
+        # Auto-detection state (AD-0)
+        self._touched = set()  # field keys manually edited by the user
+        self._last_detected_script = None  # avoid redundant re-detection
+
         self._build_ui()
         self._load_settings()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -297,27 +611,37 @@ class VenvToExeApp:
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Nombre de la app:", width=20).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.app_name).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e = ttk.Entry(row, textvariable=self.app_name)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e.bind('<KeyRelease>', lambda _: self._touched.add('app_name'))
 
         # --- Venv path ---
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Ruta del venv:", width=20).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.venv_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e = ttk.Entry(row, textvariable=self.venv_path)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e.bind('<KeyRelease>', lambda _: self._touched.add('venv_path'))
         ttk.Button(row, text="Buscar", command=self._browse_venv).pack(side=tk.LEFT, padx=(5, 0))
 
         # --- Entry script ---
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Script principal (.py):", width=20).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.entry_script).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._script_entry = ttk.Entry(row, textvariable=self.entry_script)
+        self._script_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._script_entry.bind('<FocusOut>', self._on_script_entry_change)
+        self._script_entry.bind('<Return>', self._on_script_entry_change)
         ttk.Button(row, text="Buscar", command=self._browse_script).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(row, text="Re-detectar", command=self._redetect).pack(side=tk.LEFT, padx=(5, 0))
 
         # --- Icon ---
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Icono (.ico/.png):", width=20).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.icon_path).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e = ttk.Entry(row, textvariable=self.icon_path)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e.bind('<KeyRelease>', lambda _: self._touched.add('icon_path'))
         ttk.Button(row, text="Buscar", command=self._browse_icon).pack(side=tk.LEFT, padx=(5, 0))
 
         # --- Icon preview ---
@@ -328,7 +652,9 @@ class VenvToExeApp:
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Directorio de salida:", width=20).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.output_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e = ttk.Entry(row, textvariable=self.output_dir)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e.bind('<KeyRelease>', lambda _: self._touched.add('output_dir'))
         ttk.Button(row, text="Buscar", command=self._browse_output).pack(side=tk.LEFT, padx=(5, 0))
 
         # --- Platform ---
@@ -383,7 +709,9 @@ class VenvToExeApp:
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Archivos extra:", width=20).pack(side=tk.LEFT)
-        ttk.Entry(row, textvariable=self.extra_files).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e = ttk.Entry(row, textvariable=self.extra_files)
+        e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        e.bind('<KeyRelease>', lambda _: self._touched.add('extra_files'))
         ttk.Button(row, text="Agregar", command=self._browse_extra_files).pack(side=tk.LEFT, padx=(5, 0))
         ttk.Label(main, text="  (archivos .env, configs, datos - separados por ;)", foreground="gray").pack(anchor=tk.W)
 
@@ -417,29 +745,15 @@ class VenvToExeApp:
         path = filedialog.askdirectory(title="Seleccionar carpeta del venv")
         if path:
             self.venv_path.set(path)
-            # P2-3: verify venv sanity
-            cfg_file = os.path.join(path, 'pyvenv.cfg')
-            if os.path.isfile(cfg_file):
-                try:
-                    with open(cfg_file, 'r') as f:
-                        for line in f:
-                            if line.lower().startswith('version'):
-                                self._log(f"[INFO] Venv detectado: {line.strip()}")
-                                break
-                except Exception:
-                    pass
-            else:
-                self._log("[AVISO] No se encontro pyvenv.cfg - puede no ser un venv valido.")
+            self._touched.add('venv_path')
+            self._log_venv_info(path)
 
     def _browse_script(self):
         path = filedialog.askopenfilename(title="Seleccionar script principal",
                                           filetypes=[("Python", "*.py")])
         if path:
             self.entry_script.set(path)
-            # P2-3: prefill app name from filename if still default
-            if self.app_name.get().strip() in ('MyApp', ''):
-                stem = Path(path).stem.replace('_', ' ').title()
-                self.app_name.set(stem)
+            self._auto_detect(path)
 
     def _browse_icon(self):
         path = filedialog.askopenfilename(
@@ -448,6 +762,7 @@ class VenvToExeApp:
         )
         if path:
             self.icon_path.set(path)
+            self._touched.add('icon_path')
             self._update_icon_preview(path)
 
     def _update_icon_preview(self, path):
@@ -466,6 +781,7 @@ class VenvToExeApp:
             filetypes=[("Todos", "*.*")]
         )
         if paths:
+            self._touched.add('extra_files')
             current = self.extra_files.get()
             new_paths = ";".join(paths)
             if current:
@@ -476,6 +792,7 @@ class VenvToExeApp:
     def _browse_output(self):
         path = filedialog.askdirectory(title="Seleccionar carpeta de salida")
         if path:
+            self._touched.add('output_dir')
             self.output_dir.set(path)
 
     def _on_platform_change(self):
@@ -486,6 +803,118 @@ class VenvToExeApp:
         else:
             self.autostart_check.config(state=tk.NORMAL)
             self.autostart.set(True)
+
+    # ------------------------------------------------- Auto-detection (AD-*)
+
+    def _log_venv_info(self, path):
+        """Log venv Python version from pyvenv.cfg (shared by browse + auto-detect)."""
+        cfg_file = os.path.join(path, 'pyvenv.cfg')
+        if os.path.isfile(cfg_file):
+            try:
+                with open(cfg_file, 'r') as f:
+                    for line in f:
+                        if line.lower().startswith('version'):
+                            self._log(f"[INFO] Venv detectado: {line.strip()}")
+                            return
+            except Exception:
+                pass
+        else:
+            self._log("[AVISO] No se encontro pyvenv.cfg - puede no ser un venv valido.")
+
+    def _on_script_entry_change(self, _event=None):
+        """Trigger auto-detection when the entry-script field changes via typing."""
+        path = self.entry_script.get()
+        if path and os.path.isfile(path) and path != self._last_detected_script:
+            self._auto_detect(path)
+
+    def _redetect(self):
+        """Re-run auto-detection, clearing touched state for detectable fields."""
+        self._touched -= {'venv_path', 'icon_path', 'output_dir', 'extra_files', 'app_name'}
+        path = self.entry_script.get()
+        if path and os.path.isfile(path):
+            self._last_detected_script = None  # force re-run
+            self._auto_detect(path)
+            self._log("[INFO] Re-deteccion ejecutada.")
+        else:
+            self._log("[AVISO] Selecciona un script .py valido para re-detectar.")
+
+    def _auto_detect(self, script_path):
+        """Run all detectors on the given script path (AD-0 orchestrator)."""
+        if script_path == self._last_detected_script:
+            return
+        self._last_detected_script = script_path
+
+        script_dir = os.path.dirname(os.path.abspath(script_path))
+        script_stem = Path(script_path).stem
+        project_root = _detect_project_root(script_dir)
+
+        # Parse the script once for AD-5 / AD-7
+        source_text = ''
+        script_tree = None
+        try:
+            with open(script_path, 'r', encoding='utf-8') as f:
+                source_text = f.read()
+            script_tree = ast.parse(source_text)
+        except Exception:
+            pass
+
+        # AD-6: App name
+        if 'app_name' not in self._touched and self.app_name.get().strip() in ('MyApp', ''):
+            name = _detect_app_name(script_path, project_root)
+            if name:
+                self.app_name.set(name)
+                self._log(f"[AUTO] Nombre: {name}")
+
+        # AD-2: Venv
+        if 'venv_path' not in self._touched and not self.venv_path.get():
+            best, alts = _detect_venv(script_dir, project_root)
+            if best:
+                self.venv_path.set(best)
+                msg = f"[AUTO] Venv: {best}"
+                if alts:
+                    msg += f" (otras opciones: {', '.join(os.path.basename(a) for a in alts[:3])})"
+                self._log(msg)
+                self._log_venv_info(best)
+
+        # AD-3: Icon
+        if 'icon_path' not in self._touched and not self.icon_path.get():
+            app_name = self.app_name.get().strip()
+            icon = _detect_icon(script_dir, project_root, app_name, script_stem)
+            if icon:
+                self.icon_path.set(icon)
+                self._log(f"[AUTO] Icono: {icon}")
+                self._update_icon_preview(icon)
+
+        # AD-4: Output dir
+        if 'output_dir' not in self._touched and not self.output_dir.get():
+            out = _detect_output_dir(project_root)
+            self.output_dir.set(out)
+            self._log(f"[AUTO] Directorio de salida: {out}")
+
+        # AD-5: Extra files
+        if 'extra_files' not in self._touched and not self.extra_files.get():
+            extras = _detect_extra_files(script_dir, project_root, source_text)
+            if extras:
+                self.extra_files.set(';'.join(extras))
+                self._log(f"[AUTO] Archivos extra: {', '.join(os.path.basename(f) for f in extras)}")
+
+        # AD-7: Hidden import hints (informational only)
+        if script_tree:
+            imports = set()
+            for node in ast.walk(script_tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.add(alias.name.split('.')[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.add(node.module.split('.')[0])
+            hint_map = {'PIL': 'PIL', 'Crypto': 'Crypto', 'nacl': 'nacl', 'cv2': 'cv2',
+                        'coincurve': 'coincurve', 'cryptography': 'cryptography',
+                        'bcrypt': 'bcrypt', 'argon2': 'argon2', 'lxml': 'lxml', 'cffi': 'cffi'}
+            tricky = [k for k in imports if k in hint_map]
+            if tricky:
+                self._log(
+                    f"[AUTO] Imports que suelen necesitar hidden-imports: "
+                    f"{', '.join(tricky)} (se resolveran automaticamente en el build)")
 
     # --------------------------------------------------------- Logging (P1-10)
 
@@ -567,6 +996,9 @@ class VenvToExeApp:
             'version': self.version_var.get(),
             'company': self.company_var.get(),
         }
+        # AD-4: create output dir lazily if it doesn't exist yet
+        os.makedirs(cfg['output_dir'], exist_ok=True)
+
         self._cancel_event.clear()
         self.build_btn.config(state=tk.DISABLED)
         self.cancel_btn.config(state=tk.NORMAL)
@@ -631,12 +1063,11 @@ class VenvToExeApp:
 
     def _get_venv_python(self, cfg):
         venv = cfg['venv_path']
-        if sys.platform == 'win32':
-            py = os.path.join(venv, "Scripts", "python.exe")
-        else:
-            py = os.path.join(venv, "bin", "python")
-        if not os.path.isfile(py):
-            raise FileNotFoundError(f"No se encontro python en el venv: {py}")
+        py = _venv_python_for(venv)
+        if py is None:
+            expected = os.path.join(venv, "Scripts", "python.exe") if sys.platform == 'win32' \
+                else os.path.join(venv, "bin", "python")
+            raise FileNotFoundError(f"No se encontro python en el venv: {expected}")
         return py
 
     def _get_venv_site_packages(self, cfg):
@@ -1696,6 +2127,7 @@ jobs:
         for key, var in str_map.items():
             if s.get(key):
                 var.set(s[key])
+                self._touched.add(key)  # AD-8: loaded values count as user-touched
         for key, var in bool_map.items():
             if key in s:
                 var.set(s[key])
