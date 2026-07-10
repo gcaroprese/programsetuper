@@ -21,12 +21,26 @@ draw.ellipse([100, 110, 190, 200], fill='#f5c518')
 arrow_points = [(95, 100), (175, 140), (95, 180)]
 draw.polygon(arrow_points, fill='#ffffff')
 
-# Small "EXE" text at bottom
+# Small "EXE" text at bottom -- try truetype fonts, fall back gracefully
+use_anchor = True
 try:
-    font = ImageFont.truetype("arial.ttf", 28)
+    font = ImageFont.truetype("DejaVuSans.ttf", 28)
 except OSError:
-    font = ImageFont.load_default()
-draw.text((80, 210), "EXE", fill='#ffffff', font=font, anchor='mt')
+    try:
+        font = ImageFont.truetype("arial.ttf", 28)
+    except OSError:
+        font = ImageFont.load_default()
+        use_anchor = False  # bitmap font does not support anchors
+
+if use_anchor:
+    draw.text((128, 210), "EXE", fill='#ffffff', font=font, anchor='mt')
+else:
+    try:
+        bbox = font.getbbox("EXE")
+        text_w = bbox[2] - bbox[0]
+    except AttributeError:
+        text_w = font.getsize("EXE")[0]
+    draw.text(((SIZE - text_w) // 2, 205), "EXE", fill='#ffffff', font=font)
 
 # Save as ICO and PNG
 script_dir = os.path.dirname(os.path.abspath(__file__))

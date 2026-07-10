@@ -1,18 +1,27 @@
 """
 Venv-to-Executable Converter
-Convierte un entorno virtual Python en un unico archivo ejecutable.
-Soporta Windows (.exe), macOS (.app) y Android (.apk).
+Converts a Python virtual environment into a single executable file.
+Supports Windows (.exe), macOS (.app), and Android (.apk).
 """
 
+import ast
+import json
 import os
-import sys
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
+import time
+import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from pathlib import Path
 from string import Template
+
+SETTINGS_DIR = os.path.join(os.path.expanduser('~'), '.venv_to_exe')
+SETTINGS_FILE = os.path.join(SETTINGS_DIR, 'settings.json')
+
 
 def _hide_windows():
     """Return startupinfo and creationflags to hide CMD windows on Windows."""
@@ -23,8 +32,11 @@ def _hide_windows():
         return {'startupinfo': si, 'creationflags': subprocess.CREATE_NO_WINDOW}
     return {}
 
+
 # --- Robust autostart + error logging wrapper ---
-# Uses string.Template ($var) to avoid brace escaping issues
+# Uses string.Template ($var) to avoid brace escaping issues.
+# P0-6: mutex/flock instead of PID file.  P1-1: per-user data dir.
+# P1-2: log rotation.  P1-7: re-register on exe move.  P2-11: fast first retry.
 
 AUTOSTART_WRAPPER = Template(r'''
 # === AUTOSTART + ERROR LOGGING BOOTSTRAP ===
@@ -49,11 +61,30 @@ def _get_exe_path():
         return sys.executable
     return os.path.abspath(__file__)
 
-# --- 1. Error logging to file next to executable ---
-_LOG_PATH = os.path.join(_get_app_dir(), _APP_NAME + '_error.log')
+def _get_data_dir():
+    """Per-user data directory for logs, locks, and markers."""
+    if _PLATFORM == 'windows':
+        base = os.environ.get('LOCALAPPDATA', os.environ.get('APPDATA', os.path.expanduser('~')))
+    elif _PLATFORM == 'macos':
+        base = os.path.expanduser('~/Library/Application Support')
+    else:
+        base = os.path.join(os.path.expanduser('~'), '.local', 'share')
+    d = os.path.join(base, _APP_NAME)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+_DATA_DIR = _get_data_dir()
+
+# --- 1. Error logging with rotation (1 MB cap, 1 backup) ---
+_LOG_PATH = os.path.join(_DATA_DIR, _APP_NAME + '_error.log')
 
 def _log_error(msg):
     try:
+        if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > 1_000_000:
+            backup = _LOG_PATH + '.1'
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.rename(_LOG_PATH, backup)
         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         with open(_LOG_PATH, 'a', encoding='utf-8') as f:
             f.write(f'[{ts}] {msg}\n')
@@ -74,51 +105,22 @@ def _thread_excepthook(args):
 if hasattr(threading, 'excepthook'):
     threading.excepthook = _thread_excepthook
 
-# --- 2. Lock file with PID to avoid duplicate instances ---
-_LOCK_PATH = os.path.join(_get_app_dir(), '.' + _APP_NAME + '.lock')
-
-def _is_already_running():
-    if os.path.exists(_LOCK_PATH):
-        try:
-            with open(_LOCK_PATH, 'r') as f:
-                old_pid = int(f.read().strip())
-            if _PLATFORM == 'windows':
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                handle = kernel32.OpenProcess(0x1000, False, old_pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-                if handle:
-                    kernel32.CloseHandle(handle)
-                    return True
-            else:
-                os.kill(old_pid, 0)
-                return True
-        except (ValueError, OSError, Exception):
-            pass
-    return False
-
-def _write_lock():
-    try:
-        with open(_LOCK_PATH, 'w') as f:
-            f.write(str(os.getpid()))
-    except Exception as e:
-        _log_error(f'Failed to write lock file: {e}')
-
-def _remove_lock():
-    try:
-        if os.path.exists(_LOCK_PATH):
-            os.remove(_LOCK_PATH)
-    except Exception:
-        pass
-
+# --- 2. Single-instance enforcement (mutex on Windows, flock on POSIX) ---
 if not _ALLOW_MULTIPLE:
-    if _is_already_running():
-        sys.exit(0)
-    _write_lock()
-    atexit.register(_remove_lock)
+    if _PLATFORM == 'windows':
+        import ctypes as _ctypes
+        _mutex = _ctypes.windll.kernel32.CreateMutexW(None, False, 'Global\\' + _APP_NAME + '_singleton')
+        if _ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            sys.exit(0)
+    else:
+        import fcntl as _fcntl
+        _lock_fh = open(os.path.join(_DATA_DIR, '.' + _APP_NAME + '.lock'), 'w')
+        try:
+            _fcntl.flock(_lock_fh, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError:
+            sys.exit(0)
 
 def _signal_handler(signum, frame):
-    if not _ALLOW_MULTIPLE:
-        _remove_lock()
     sys.exit(0)
 
 for _sig in (signal.SIGTERM, signal.SIGINT):
@@ -133,26 +135,30 @@ if _PLATFORM == 'windows':
     except (AttributeError, OSError, ValueError):
         pass
 
-# --- 3. Autostart registration (first run only) ---
-_MARKER_PATH = None
-if _PLATFORM == 'windows':
-    _MARKER_PATH = os.path.join(
-        os.environ.get('APPDATA', os.path.expanduser('~')),
-        _APP_NAME, '.autostart_installed'
-    )
-elif _PLATFORM == 'macos':
-    _MARKER_PATH = os.path.expanduser('~/.' + _APP_NAME + '_autostart_installed')
+# --- 3. Autostart registration (re-registers if exe moved) ---
+_MARKER_PATH = os.path.join(_DATA_DIR, '.autostart_installed')
 
 def _register_autostart():
     exe_path = _get_exe_path()
-    if _MARKER_PATH is None:
-        return
-    if os.path.exists(_MARKER_PATH):
-        return
 
-    try:
-        if _PLATFORM == 'windows':
+    if _PLATFORM == 'windows':
+        try:
             import winreg
+            try:
+                key = winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Run",
+                    0, winreg.KEY_READ
+                )
+                existing, _ = winreg.QueryValueEx(key, _APP_NAME)
+                winreg.CloseKey(key)
+                if existing == exe_path:
+                    if not os.path.exists(_MARKER_PATH):
+                        with open(_MARKER_PATH, 'w') as f:
+                            f.write(exe_path)
+                    return
+            except (FileNotFoundError, OSError):
+                pass
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
                 r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -160,34 +166,47 @@ def _register_autostart():
             )
             winreg.SetValueEx(key, _APP_NAME, 0, winreg.REG_SZ, exe_path)
             winreg.CloseKey(key)
-            pass  # Registered OK
+        except Exception as e:
+            _log_error(f'Autostart registration FAILED: {e}\n{traceback.format_exc()}')
+            return
 
-        elif _PLATFORM == 'macos':
+    elif _PLATFORM == 'macos':
+        try:
             import plistlib
+            plist_dir = os.path.expanduser('~/Library/LaunchAgents')
+            plist_path = os.path.join(plist_dir, _APP_NAME + '.plist')
+            if os.path.exists(plist_path):
+                try:
+                    with open(plist_path, 'rb') as fp:
+                        existing = plistlib.load(fp)
+                    if existing.get('ProgramArguments', [None])[0] == exe_path:
+                        if not os.path.exists(_MARKER_PATH):
+                            with open(_MARKER_PATH, 'w') as f:
+                                f.write(exe_path)
+                        return
+                except Exception:
+                    pass
             plist = {
                 'Label': _APP_NAME,
                 'ProgramArguments': [exe_path],
                 'RunAtLoad': True,
                 'KeepAlive': False,
             }
-            plist_dir = os.path.expanduser('~/Library/LaunchAgents')
             os.makedirs(plist_dir, exist_ok=True)
-            plist_path = os.path.join(plist_dir, _APP_NAME + '.plist')
             with open(plist_path, 'wb') as fp:
                 plistlib.dump(plist, fp)
-            pass  # Registered OK
+        except Exception as e:
+            _log_error(f'Autostart registration FAILED: {e}\n{traceback.format_exc()}')
+            return
+    else:
+        return
 
-        # Mark as installed only after success
-        os.makedirs(os.path.dirname(_MARKER_PATH), exist_ok=True)
-        with open(_MARKER_PATH, 'w') as f:
-            f.write(str(os.getpid()))
+    with open(_MARKER_PATH, 'w') as f:
+        f.write(exe_path)
 
-    except Exception as e:
-        _log_error(f'Autostart registration FAILED: {e}\n{traceback.format_exc()}')
-
-# --- 4. Run autostart with retry every hour if it fails ---
-_RETRY_INTERVAL = 3600  # 1 hour in seconds
+# --- 4. Run autostart with retry (60 s first, then hourly, max 8) ---
 _RETRY_MAX = 8
+_stop_retry = threading.Event()
 _autostart_done = threading.Event()
 
 def _autostart_worker():
@@ -199,13 +218,11 @@ def _autostart_worker():
         _autostart_done.set()
 
 def _autostart_retry_loop():
-    """If autostart not yet installed, retry every hour in background (max 8 attempts)."""
-    if _MARKER_PATH is None:
-        return
-    for attempt in range(1, _RETRY_MAX + 1):
+    delays = [60] + [3600] * (_RETRY_MAX - 1)
+    for attempt, delay in enumerate(delays, 1):
         if os.path.exists(_MARKER_PATH):
             return
-        _stop_retry.wait(timeout=_RETRY_INTERVAL)
+        _stop_retry.wait(timeout=delay)
         if _stop_retry.is_set():
             return
         try:
@@ -216,30 +233,21 @@ def _autostart_retry_loop():
             _log_error(f'Autostart retry {attempt}/{_RETRY_MAX} FAILED: {e}')
     _log_error(f'Autostart gave up after {_RETRY_MAX} retries.')
 
-_stop_retry = threading.Event()
+atexit.register(lambda: _stop_retry.set())
 
-def _stop_retry_on_exit():
-    _stop_retry.set()
-
-atexit.register(_stop_retry_on_exit)
-
-# First attempt (blocking, 10s timeout)
-_autostart_thread = threading.Thread(target=_autostart_worker, daemon=True)
-_autostart_thread.start()
-_autostart_done.wait(timeout=10)
-
-# If first attempt failed, start hourly retry in background
-if _MARKER_PATH and not os.path.exists(_MARKER_PATH):
-    _retry_thread = threading.Thread(target=_autostart_retry_loop, daemon=True)
-    _retry_thread.start()
+if _PLATFORM in ('windows', 'macos'):
+    _autostart_thread = threading.Thread(target=_autostart_worker, daemon=True)
+    _autostart_thread.start()
+    _autostart_done.wait(timeout=10)
+    if not os.path.exists(_MARKER_PATH):
+        _retry_thread = threading.Thread(target=_autostart_retry_loop, daemon=True)
+        _retry_thread.start()
 
 # --- 5. Fix working directory to exe location ---
-# PyInstaller --onefile extracts to a temp dir; ensure cwd and .env are found next to the exe
 os.chdir(_get_app_dir())
 if os.path.exists(os.path.join(_get_app_dir(), '.env')):
     os.environ.setdefault('DOTENV_PATH', os.path.join(_get_app_dir(), '.env'))
 
-# Only log errors, not normal startup
 # === END AUTOSTART BOOTSTRAP ===
 ''')
 
@@ -248,23 +256,39 @@ class VenvToExeApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Venv to Executable Converter")
-        self.root.geometry("750x700")
+        self.root.geometry("750x750")
         self.root.resizable(True, True)
 
+        # Form variables
         self.venv_path = tk.StringVar()
         self.entry_script = tk.StringVar()
         self.icon_path = tk.StringVar()
         self.app_name = tk.StringVar(value="MyApp")
-        self.platform_var = tk.StringVar(value="windows")
+        host_plat = "windows" if sys.platform == "win32" else ("macos" if sys.platform == "darwin" else "android")
+        self.platform_var = tk.StringVar(value=host_plat)
         self.output_dir = tk.StringVar()
         self.autostart = tk.BooleanVar(value=True)
         self.onefile = tk.BooleanVar(value=True)
         self.noconsole = tk.BooleanVar(value=True)
         self.allow_multiple = tk.BooleanVar(value=False)
         self.extra_files = tk.StringVar()
+        self.hidden_imports_extra = tk.StringVar()  # P2-4
+        self.version_var = tk.StringVar(value="1.0.0")  # P2-5
+        self.company_var = tk.StringVar()  # P2-5
+
+        # Thread-safety state
+        self._proc_lock = threading.Lock()
+        self._current_proc = None
+        self._cancel_event = threading.Event()
+        self._log_lock = threading.Lock()
+        self._log_buffer = []
+        self._log_flush_pending = False
 
         self._build_ui()
+        self._load_settings()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+    # ------------------------------------------------------------------ UI
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill=tk.BOTH, expand=True)
@@ -316,9 +340,21 @@ class VenvToExeApp:
             ("macOS (.app)", "macos"),
             ("Android (.apk)", "android"),
         ]
+        self._platform_radios = {}
         for text, val in platforms:
-            ttk.Radiobutton(plat_frame, text=text, variable=self.platform_var,
-                            value=val, command=self._on_platform_change).pack(side=tk.LEFT, padx=15)
+            rb = ttk.Radiobutton(plat_frame, text=text, variable=self.platform_var,
+                                 value=val, command=self._on_platform_change)
+            rb.pack(side=tk.LEFT, padx=15)
+            self._platform_radios[val] = rb
+
+        # Disable cross-compilation (P0-4)
+        if sys.platform != 'win32':
+            self._platform_radios['windows'].config(state=tk.DISABLED)
+        if sys.platform != 'darwin':
+            self._platform_radios['macos'].config(state=tk.DISABLED)
+
+        ttk.Label(plat_frame, text="(solo el SO actual; Android usa la nube)",
+                  foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
 
         # --- Options ---
         opt_frame = ttk.LabelFrame(main, text="Opciones", padding=10)
@@ -327,14 +363,23 @@ class VenvToExeApp:
         self.autostart_check = ttk.Checkbutton(opt_frame, text="Iniciar con el sistema (primera ejecucion)",
                                                 variable=self.autostart)
         self.autostart_check.pack(side=tk.LEFT, padx=10)
-
         ttk.Checkbutton(opt_frame, text="Un solo archivo", variable=self.onefile).pack(side=tk.LEFT, padx=10)
         ttk.Checkbutton(opt_frame, text="Sin consola (background)", variable=self.noconsole).pack(side=tk.LEFT, padx=10)
         self.multi_check = ttk.Checkbutton(opt_frame, text="Permitir multiples instancias",
                                             variable=self.allow_multiple)
         self.multi_check.pack(side=tk.LEFT, padx=10)
 
-        # --- Extra files (.env, configs, data) ---
+        # --- Metadata (P2-5) ---
+        meta_frame = ttk.LabelFrame(main, text="Metadata (Windows)", padding=10)
+        meta_frame.pack(fill=tk.X, pady=5)
+        row = ttk.Frame(meta_frame)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Version:", width=10).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.version_var, width=12).pack(side=tk.LEFT)
+        ttk.Label(row, text="Empresa/Autor:", width=15).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Entry(row, textvariable=self.company_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # --- Extra files ---
         row = ttk.Frame(main)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Archivos extra:", width=20).pack(side=tk.LEFT)
@@ -342,9 +387,20 @@ class VenvToExeApp:
         ttk.Button(row, text="Agregar", command=self._browse_extra_files).pack(side=tk.LEFT, padx=(5, 0))
         ttk.Label(main, text="  (archivos .env, configs, datos - separados por ;)", foreground="gray").pack(anchor=tk.W)
 
-        # --- Build button ---
-        self.build_btn = ttk.Button(main, text="COMPILAR", command=self._start_build)
-        self.build_btn.pack(pady=10)
+        # --- Hidden imports extra (P2-4) ---
+        row = ttk.Frame(main)
+        row.pack(fill=tk.X, pady=3)
+        ttk.Label(row, text="Hidden imports extra:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(row, textvariable=self.hidden_imports_extra).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(main, text="  (modulos Python extra separados por ;)", foreground="gray").pack(anchor=tk.W)
+
+        # --- Build + Cancel buttons (P2-1) ---
+        btn_frame = ttk.Frame(main)
+        btn_frame.pack(pady=10)
+        self.build_btn = ttk.Button(btn_frame, text="COMPILAR", command=self._start_build)
+        self.build_btn.pack(side=tk.LEFT, padx=5)
+        self.cancel_btn = ttk.Button(btn_frame, text="Cancelar", command=self._cancel_build, state=tk.DISABLED)
+        self.cancel_btn.pack(side=tk.LEFT, padx=5)
 
         # --- Progress ---
         self.progress = ttk.Progressbar(main, mode='indeterminate')
@@ -352,19 +408,38 @@ class VenvToExeApp:
 
         # --- Log ---
         ttk.Label(main, text="Log de compilacion:").pack(anchor=tk.W)
-        self.log = scrolledtext.ScrolledText(main, height=14, state=tk.DISABLED, wrap=tk.WORD)
+        self.log = scrolledtext.ScrolledText(main, height=12, state=tk.DISABLED, wrap=tk.WORD)
         self.log.pack(fill=tk.BOTH, expand=True, pady=3)
+
+    # ---------------------------------------------------------- Browse helpers
 
     def _browse_venv(self):
         path = filedialog.askdirectory(title="Seleccionar carpeta del venv")
         if path:
             self.venv_path.set(path)
+            # P2-3: verify venv sanity
+            cfg_file = os.path.join(path, 'pyvenv.cfg')
+            if os.path.isfile(cfg_file):
+                try:
+                    with open(cfg_file, 'r') as f:
+                        for line in f:
+                            if line.lower().startswith('version'):
+                                self._log(f"[INFO] Venv detectado: {line.strip()}")
+                                break
+                except Exception:
+                    pass
+            else:
+                self._log("[AVISO] No se encontro pyvenv.cfg - puede no ser un venv valido.")
 
     def _browse_script(self):
         path = filedialog.askopenfilename(title="Seleccionar script principal",
                                           filetypes=[("Python", "*.py")])
         if path:
             self.entry_script.set(path)
+            # P2-3: prefill app name from filename if still default
+            if self.app_name.get().strip() in ('MyApp', ''):
+                stem = Path(path).stem.replace('_', ' ').title()
+                self.app_name.set(stem)
 
     def _browse_icon(self):
         path = filedialog.askopenfilename(
@@ -382,8 +457,6 @@ class VenvToExeApp:
             img = img.resize((48, 48), Image.LANCZOS)
             self._icon_photo = ImageTk.PhotoImage(img)
             self.icon_preview_label.config(image=self._icon_photo, text="")
-        except ImportError:
-            self.icon_preview_label.config(text=f"Icono: {os.path.basename(path)}", image="")
         except Exception:
             self.icon_preview_label.config(text=f"Icono: {os.path.basename(path)}", image="")
 
@@ -414,11 +487,40 @@ class VenvToExeApp:
             self.autostart_check.config(state=tk.NORMAL)
             self.autostart.set(True)
 
+    # --------------------------------------------------------- Logging (P1-10)
+
     def _log(self, msg):
+        """Log to widget -- must be called from main thread."""
         self.log.config(state=tk.NORMAL)
         self.log.insert(tk.END, msg + "\n")
         self.log.see(tk.END)
         self.log.config(state=tk.DISABLED)
+
+    def _log_threadsafe(self, msg):
+        """Thread-safe buffered logging (flushes every 100 ms)."""
+        with self._log_lock:
+            self._log_buffer.append(msg)
+            if not self._log_flush_pending:
+                self._log_flush_pending = True
+                self.root.after(100, self._flush_log_buffer)
+
+    def _flush_log_buffer(self):
+        """Flush buffered log lines to widget -- runs on main thread."""
+        with self._log_lock:
+            lines = self._log_buffer[:]
+            self._log_buffer.clear()
+            self._log_flush_pending = False
+        if lines:
+            self.log.config(state=tk.NORMAL)
+            self.log.insert(tk.END, '\n'.join(lines) + '\n')
+            self.log.see(tk.END)
+            self.log.config(state=tk.DISABLED)
+
+    def _flush_log_now(self):
+        """Force-flush any remaining buffered log lines."""
+        self._flush_log_buffer()
+
+    # --------------------------------------------------------- Validation
 
     def _validate(self):
         if not self.app_name.get().strip():
@@ -433,34 +535,102 @@ class VenvToExeApp:
         if not self.output_dir.get():
             messagebox.showerror("Error", "Selecciona un directorio de salida.")
             return False
+        # P0-4: reject cross-compilation
+        plat = self.platform_var.get()
+        if plat == 'windows' and sys.platform != 'win32':
+            messagebox.showerror("Error", "Solo se puede compilar para Windows desde Windows.")
+            return False
+        if plat == 'macos' and sys.platform != 'darwin':
+            messagebox.showerror("Error", "Solo se puede compilar para macOS desde macOS.")
+            return False
         return True
+
+    # ---------------------------------------------------- Build orchestration
 
     def _start_build(self):
         if not self._validate():
             return
+        # P1-3: snapshot all Tk variables before entering worker thread
+        cfg = {
+            'app_name': self.app_name.get().strip(),
+            'venv_path': self.venv_path.get(),
+            'entry_script': self.entry_script.get(),
+            'icon_path': self.icon_path.get(),
+            'output_dir': self.output_dir.get(),
+            'platform': self.platform_var.get(),
+            'autostart': self.autostart.get(),
+            'onefile': self.onefile.get(),
+            'noconsole': self.noconsole.get(),
+            'allow_multiple': self.allow_multiple.get(),
+            'extra_files': self.extra_files.get(),
+            'hidden_imports_extra': self.hidden_imports_extra.get(),
+            'version': self.version_var.get(),
+            'company': self.company_var.get(),
+        }
+        self._cancel_event.clear()
         self.build_btn.config(state=tk.DISABLED)
+        self.cancel_btn.config(state=tk.NORMAL)
         self.progress.start(10)
-        t = threading.Thread(target=self._build, daemon=True)
+        t = threading.Thread(target=self._build, args=(cfg,), daemon=True)
         t.start()
 
-    def _build(self):
+    def _build(self, cfg):
         try:
-            plat = self.platform_var.get()
+            plat = cfg['platform']
+            # P2-6: AV false-positive warning
+            if plat == 'windows' and cfg['noconsole'] and cfg['onefile'] and cfg['autostart']:
+                self._log_threadsafe(
+                    "[AVISO] La combinacion noconsole + onefile + autostart suele activar "
+                    "heuristicas de antivirus. Se recomienda firmar el binario (signtool).")
             if plat == "windows":
-                self._build_windows()
+                self._build_windows(cfg)
             elif plat == "macos":
-                self._build_macos()
+                self._build_macos(cfg)
             elif plat == "android":
-                self._build_android()
+                self._build_android(cfg)
+            # P2-2: save settings on success
+            self.root.after(0, self._save_settings)
         except Exception as e:
-            self.root.after(0, lambda: self._log(f"[ERROR] {e}"))
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+            # P0-1: bind error message eagerly to avoid NameError from late-bound `e`
+            err_msg = str(e)
+            tb = traceback.format_exc()
+            self._log_threadsafe(f"[ERROR] {err_msg}\n{tb}")
+            self.root.after(0, lambda m=err_msg: messagebox.showerror("Error", m))
         finally:
+            self.root.after(0, self._flush_log_now)
             self.root.after(0, self.progress.stop)
             self.root.after(0, lambda: self.build_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.cancel_btn.config(state=tk.DISABLED))
 
-    def _get_venv_python(self):
-        venv = self.venv_path.get()
+    # -------------------------------------------------- Cancel (P2-1)
+
+    def _cancel_build(self):
+        self._cancel_event.set()
+        with self._proc_lock:
+            proc = self._current_proc
+        if proc:
+            self._kill_proc_tree(proc)
+        self._log("[INFO] Build cancelado.")
+
+    def _kill_proc_tree(self, proc):
+        try:
+            if sys.platform == 'win32':
+                subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)],
+                               capture_output=True, **_hide_windows())
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+    def _check_cancelled(self):
+        """Raise if build was cancelled.  Call between build steps."""
+        if self._cancel_event.is_set():
+            raise RuntimeError("Build cancelado por el usuario.")
+
+    # -------------------------------------------------- Venv helpers
+
+    def _get_venv_python(self, cfg):
+        venv = cfg['venv_path']
         if sys.platform == 'win32':
             py = os.path.join(venv, "Scripts", "python.exe")
         else:
@@ -469,12 +639,11 @@ class VenvToExeApp:
             raise FileNotFoundError(f"No se encontro python en el venv: {py}")
         return py
 
-    def _get_venv_site_packages(self):
-        venv = self.venv_path.get()
+    def _get_venv_site_packages(self, cfg):
+        venv = cfg['venv_path']
         if sys.platform == 'win32':
             sp = os.path.join(venv, "Lib", "site-packages")
         else:
-            # Find the python version directory
             lib_dir = os.path.join(venv, "lib")
             if os.path.isdir(lib_dir):
                 for d in os.listdir(lib_dir):
@@ -487,81 +656,131 @@ class VenvToExeApp:
             raise FileNotFoundError(f"No se encontro site-packages: {sp}")
         return sp
 
-    def _prepare_autostart_wrapper(self, script_path):
-        """Prepend autostart code to the entry script in a temp copy."""
-        app_name = self.app_name.get().strip()
-        plat = self.platform_var.get()
+    # ----------------------------------------- Autostart wrapper (P0-2)
 
+    def _prepare_autostart_wrapper(self, script_path, cfg):
+        """Prepend autostart wrapper respecting __future__ imports, encoding, and docstrings."""
         with open(script_path, 'r', encoding='utf-8') as f:
-            original_code = f.read()
+            original_lines = f.readlines()
+
+        source = ''.join(original_lines)
+
+        # 1. Extract shebang / encoding comment lines from first 2 physical lines
+        prefix_indices = set()
+        for i in range(min(2, len(original_lines))):
+            line = original_lines[i].strip()
+            if line.startswith('#!') or (line.startswith('#') and 'coding' in line):
+                prefix_indices.add(i)
+
+        docstring_indices = set()
+        future_indices = set()
+
+        # 2. Use AST to locate module docstring and __future__ imports
+        try:
+            tree = ast.parse(source)
+            if (tree.body and isinstance(tree.body[0], ast.Expr)
+                    and isinstance(getattr(tree.body[0], 'value', None), ast.Constant)
+                    and isinstance(tree.body[0].value.value, str)):
+                node = tree.body[0]
+                for ln in range(node.lineno - 1, node.end_lineno):
+                    docstring_indices.add(ln)
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and node.module == '__future__':
+                    for ln in range(node.lineno - 1, node.end_lineno):
+                        future_indices.add(ln)
+        except SyntaxError:
+            pass  # fall back to simple prepend
+
+        all_extracted = prefix_indices | docstring_indices | future_indices
 
         wrapper = AUTOSTART_WRAPPER.substitute(
-            app_name_repr=repr(app_name),
-            platform_repr=repr(plat),
-            allow_multiple_repr=repr(self.allow_multiple.get()),
+            app_name_repr=repr(cfg['app_name']),
+            platform_repr=repr(cfg['platform']),
+            allow_multiple_repr=repr(cfg['allow_multiple']),
         )
 
-        temp_dir = os.path.join(self.output_dir.get(), "_temp_build")
+        # 3. Reassemble: prefix -> docstring -> future -> wrapper -> rest
+        parts = []
+        for i in sorted(prefix_indices):
+            parts.append(original_lines[i])
+        for i in sorted(docstring_indices):
+            parts.append(original_lines[i])
+        for i in sorted(future_indices):
+            parts.append(original_lines[i])
+        parts.append(wrapper)
+        parts.append('\n')
+        for i, line in enumerate(original_lines):
+            if i not in all_extracted:
+                parts.append(line)
+
+        temp_dir = os.path.join(cfg['output_dir'], "_temp_build")
         os.makedirs(temp_dir, exist_ok=True)
         temp_script = os.path.join(temp_dir, os.path.basename(script_path))
 
         with open(temp_script, 'w', encoding='utf-8') as f:
-            f.write(wrapper + "\n" + original_code)
+            f.write(''.join(parts))
 
         return temp_script
 
-    def _get_extra_files(self):
-        """Return list of extra file paths from the entry field."""
-        raw = self.extra_files.get().strip()
+    # ------------------------------------------------- Extra files
+
+    def _get_extra_files(self, cfg):
+        raw = cfg['extra_files'].strip()
         if not raw:
             return []
         return [p.strip() for p in raw.split(";") if p.strip() and os.path.isfile(p.strip())]
 
-    def _copy_extra_files_to_output(self, output_dir, app_name):
-        """Copy extra files next to the executable for runtime access."""
-        for fpath in self._get_extra_files():
+    def _copy_extra_files_to_output(self, output_dir, cfg):
+        """Copy extra files next to the executable for runtime access (P1-4)."""
+        for fpath in self._get_extra_files(cfg):
             dst = os.path.join(output_dir, os.path.basename(fpath))
             try:
                 shutil.copy2(fpath, dst)
-                self.root.after(0, lambda d=dst: self._log(f"[INFO] Archivo extra copiado: {d}"))
+                self._log_threadsafe(f"[INFO] Archivo extra copiado: {dst}")
             except Exception as e:
-                self.root.after(0, lambda e=e: self._log(f"[AVISO] No se pudo copiar archivo extra: {e}"))
+                self._log_threadsafe(f"[AVISO] No se pudo copiar archivo extra: {e}")
+        # Warn about .env secrets
+        env_files = [f for f in self._get_extra_files(cfg)
+                     if os.path.basename(f).endswith('.env') or os.path.basename(f) == '.env']
+        if env_files:
+            self._log_threadsafe(
+                "[AVISO] .env contiene secretos: no lo distribuyas junto al binario a terceros.")
+
+    # ----------------------------------------- PyInstaller helpers
 
     def _patch_pyinstaller_dis_bug(self, site_packages):
-        """Patch PyInstaller's modulegraph/util.py to handle Python 3.10 RC dis.get_instructions bug."""
+        """Patch PyInstaller's modulegraph/util.py to handle Python 3.10 RC dis bug (P1-8)."""
         util_path = os.path.join(site_packages, 'PyInstaller', 'lib', 'modulegraph', 'util.py')
         if not os.path.isfile(util_path):
             return
         with open(util_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        # Already patched?
-        if 'IndexError' in content:
+        sentinel = '# venv_to_exe patch: dis IndexError fix'
+        if sentinel in content:
             return
-        # Original line:
-        #   yield from (i for i in dis.get_instructions(code_object) if i.opname != "EXTENDED_ARG")
-        # Replace with a version that catches IndexError from buggy dis module
         old = '    yield from (i for i in dis.get_instructions(code_object) if i.opname != "EXTENDED_ARG")'
+        if old not in content:
+            self._log_threadsafe("[INFO] PyInstaller dis patch not needed (pattern not found)")
+            return
         new = (
+            f'    {sentinel}\n'
             '    try:\n'
             '        _instructions = [i for i in dis.get_instructions(code_object) if i.opname != "EXTENDED_ARG"]\n'
             '    except IndexError:\n'
-            '        return  # Skip modules with bytecode incompatible with this Python version\n'
+            '        return\n'
             '    yield from _instructions'
         )
-        if old in content:
-            content = content.replace(old, new)
-            with open(util_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            # Remove cached bytecode so the patched .py is used
-            cache_dir = os.path.join(os.path.dirname(util_path), '__pycache__')
-            if os.path.isdir(cache_dir):
-                shutil.rmtree(cache_dir, ignore_errors=True)
-            self.root.after(0, lambda: self._log("[INFO] Parcheado PyInstaller para compatibilidad con Python 3.10 RC"))
+        content = content.replace(old, new)
+        with open(util_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        cache_dir = os.path.join(os.path.dirname(util_path), '__pycache__')
+        if os.path.isdir(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        self._log_threadsafe("[INFO] Parcheado PyInstaller para compatibilidad con Python 3.10 RC")
 
     def _detect_hidden_imports(self, site_packages):
         """Scan site-packages for native modules PyInstaller often misses."""
         hidden = []
-        # Packages known to have native CFFI/C extensions PyInstaller misses
         problem_packages = {
             'coincurve': ['coincurve._cffi_backend', 'coincurve._libsecp256k1'],
             'nacl': ['nacl._sodium'],
@@ -591,70 +810,172 @@ class VenvToExeApp:
                     binaries.append((src, pkg))
         return binaries
 
-    def _convert_icon_to_ico(self, icon_path):
+    def _convert_icon_to_ico(self, icon_path, cfg):
         """Convert png to ico if needed for Windows."""
         if icon_path.lower().endswith('.ico'):
             return icon_path
         try:
             from PIL import Image
             img = Image.open(icon_path)
-            ico_path = os.path.join(self.output_dir.get(), "_temp_build", "icon.ico")
+            ico_path = os.path.join(cfg['output_dir'], "_temp_build", "icon.ico")
             os.makedirs(os.path.dirname(ico_path), exist_ok=True)
             img.save(ico_path, format='ICO', sizes=[(256, 256), (128, 128), (64, 64), (48, 48), (32, 32), (16, 16)])
             return ico_path
         except ImportError:
-            self.root.after(0, lambda: self._log("[AVISO] Pillow no instalado, no se puede convertir PNG a ICO. Usando sin icono."))
+            self._log_threadsafe("[AVISO] Pillow no instalado, no se puede convertir PNG a ICO.")
             return None
         except Exception as e:
-            self.root.after(0, lambda: self._log(f"[AVISO] No se pudo convertir icono: {e}"))
+            self._log_threadsafe(f"[AVISO] No se pudo convertir icono: {e}")
             return None
 
+    def _convert_icon_to_icns(self, icon_path, cfg):
+        """Convert icon to .icns for macOS (P1-6)."""
+        if icon_path.lower().endswith('.icns'):
+            return icon_path
+        try:
+            from PIL import Image
+            tmp_dir = os.path.join(cfg['output_dir'], "_temp_build")
+            os.makedirs(tmp_dir, exist_ok=True)
+            png_path = os.path.join(tmp_dir, "icon_1024.png")
+            Image.open(icon_path).resize((1024, 1024), Image.LANCZOS).save(png_path, format='PNG')
+            icns_path = os.path.join(tmp_dir, "icon.icns")
+            r = subprocess.run(['sips', '-s', 'format', 'icns', png_path, '--out', icns_path],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and os.path.isfile(icns_path):
+                return icns_path
+            self._log_threadsafe(f"[AVISO] sips fallo al convertir icono: {r.stderr.strip()}")
+        except ImportError:
+            self._log_threadsafe("[AVISO] Pillow no instalado, no se puede convertir icono a ICNS.")
+        except Exception as e:
+            self._log_threadsafe(f"[AVISO] No se pudo convertir icono a ICNS: {e}")
+        return None
+
+    def _generate_version_file(self, cfg, build_tmp):
+        """Generate PyInstaller version-file for Windows exe metadata (P2-5)."""
+        version = cfg.get('version', '1.0.0') or '1.0.0'
+        company = cfg.get('company', '') or ''
+        app_name = cfg['app_name']
+        parts = version.split('.')
+        while len(parts) < 4:
+            parts.append('0')
+        ver_tuple = tuple(int(p) if p.isdigit() else 0 for p in parts[:4])
+        ver_str = '.'.join(str(v) for v in ver_tuple)
+        ver_path = os.path.join(build_tmp, 'version_info.txt')
+        with open(ver_path, 'w', encoding='utf-8') as f:
+            f.write(
+                f"VSVersionInfo(\n"
+                f"  ffi=FixedFileInfo(\n"
+                f"    filevers={ver_tuple},\n"
+                f"    prodvers={ver_tuple},\n"
+                f"    mask=0x3f,\n"
+                f"    flags=0x0,\n"
+                f"    OS=0x40004,\n"
+                f"    fileType=0x1,\n"
+                f"    subtype=0x0,\n"
+                f"    date=(0, 0)\n"
+                f"  ),\n"
+                f"  kids=[\n"
+                f"    StringFileInfo(\n"
+                f"      [StringTable('040904B0',\n"
+                f"        [StringStruct('CompanyName', {repr(company)}),\n"
+                f"         StringStruct('FileDescription', {repr(app_name)}),\n"
+                f"         StringStruct('FileVersion', {repr(ver_str)}),\n"
+                f"         StringStruct('ProductName', {repr(app_name)}),\n"
+                f"         StringStruct('ProductVersion', {repr(ver_str)})])]\n"
+                f"    ),\n"
+                f"    VarFileInfo([VarStruct('Translation', [1033, 1200])])\n"
+                f"  ]\n"
+                f")\n"
+            )
+        return ver_path
+
+    def _detect_script_execution_style(self, script_path):
+        """Detect how a script should be executed: 'main_func', 'main_guard', or 'module_level' (P1-5)."""
+        try:
+            with open(script_path, 'r', encoding='utf-8') as f:
+                tree = ast.parse(f.read())
+        except SyntaxError:
+            return 'module_level'
+        has_main_func = False
+        has_main_guard = False
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == 'main':
+                has_main_func = True
+            elif isinstance(node, ast.If):
+                test = node.test
+                if (isinstance(test, ast.Compare) and len(test.ops) == 1
+                        and isinstance(test.ops[0], ast.Eq)
+                        and isinstance(test.left, ast.Name) and test.left.id == '__name__'
+                        and len(test.comparators) == 1
+                        and isinstance(test.comparators[0], ast.Constant)
+                        and test.comparators[0].value == '__main__'):
+                    has_main_guard = True
+        if has_main_func:
+            return 'main_func'
+        if has_main_guard:
+            return 'main_guard'
+        return 'module_level'
+
+    # -------------------------------------------------- Run subprocess
+
     def _run_cmd(self, cmd, cwd=None, env=None):
-        self.root.after(0, lambda: self._log(f"$ {' '.join(cmd)}"))
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=cwd, env=env, text=True, errors='replace',
-            **_hide_windows(),
-        )
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                self.root.after(0, lambda l=line: self._log(l))
-        proc.wait()
+        # P2-10: pretty-print command
+        self._log_threadsafe(f"$ {subprocess.list2cmdline(cmd)}")
+        with self._proc_lock:
+            self._check_cancelled()
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=cwd, env=env, text=True, errors='replace',
+                **_hide_windows(),
+            )
+            self._current_proc = proc
+        try:
+            for line in proc.stdout:
+                if self._cancel_event.is_set():
+                    self._kill_proc_tree(proc)
+                    raise RuntimeError("Build cancelado por el usuario.")
+                line = line.rstrip()
+                if line:
+                    self._log_threadsafe(line)
+            proc.wait()
+        finally:
+            with self._proc_lock:
+                self._current_proc = None
         if proc.returncode != 0:
             raise RuntimeError(f"Comando fallo con codigo {proc.returncode}")
         return proc.returncode
 
-    def _build_windows(self):
-        self.root.after(0, lambda: self._log("=== Compilando para Windows ==="))
+    # ================================================= Windows build
 
-        venv_python = self._get_venv_python()
-        site_packages = self._get_venv_site_packages()
-        script = self.entry_script.get()
-        app_name = self.app_name.get().strip()
-        output = self.output_dir.get()
+    def _build_windows(self, cfg):
+        self._log_threadsafe("=== Compilando para Windows ===")
 
-        # Prepare script with autostart if enabled
-        if self.autostart.get():
-            script = self._prepare_autostart_wrapper(script)
-            self.root.after(0, lambda: self._log("[INFO] Autostart para Windows habilitado."))
+        venv_python = self._get_venv_python(cfg)
+        site_packages = self._get_venv_site_packages(cfg)
+        script = cfg['entry_script']
+        app_name = cfg['app_name']
+        output = cfg['output_dir']
 
-        # Ensure pyinstaller is available
-        self.root.after(0, lambda: self._log("[INFO] Verificando PyInstaller en el venv..."))
+        if cfg['autostart']:
+            script = self._prepare_autostart_wrapper(script, cfg)
+            self._log_threadsafe("[INFO] Autostart para Windows habilitado.")
+
+        self._check_cancelled()
+        self._log_threadsafe("[INFO] Verificando PyInstaller en el venv...")
         try:
             self._run_cmd([venv_python, "-m", "pip", "install", "pyinstaller", "--quiet"])
         except Exception:
-            self.root.after(0, lambda: self._log("[AVISO] No se pudo instalar PyInstaller en venv, usando el del sistema."))
+            self._log_threadsafe("[AVISO] No se pudo instalar PyInstaller en venv, usando el del sistema.")
 
-        # Use temp dir in user's TEMP folder to avoid antivirus interference
-        import tempfile
         build_tmp = tempfile.mkdtemp(prefix=f"{app_name}_build_")
-        self.root.after(0, lambda: self._log(f"[INFO] Carpeta temporal de build: {build_tmp}"))
+        self._log_threadsafe(f"[INFO] Carpeta temporal de build: {build_tmp}")
 
-        # Patch PyInstaller's modulegraph util.py to work around Python 3.10 RC dis bug
         self._patch_pyinstaller_dis_bug(site_packages)
+        self._check_cancelled()
 
-        # Build command
+        # P0-3: add original script dir so sibling imports are found
+        original_script_dir = os.path.dirname(os.path.abspath(cfg['entry_script']))
+
         cmd = [
             venv_python, "-m", "PyInstaller",
             "--name", app_name,
@@ -662,38 +983,46 @@ class VenvToExeApp:
             "--workpath", os.path.join(build_tmp, "work"),
             "--specpath", os.path.join(build_tmp, "work"),
             "--paths", site_packages,
+            "--paths", original_script_dir,
             "--noconfirm",
             "--clean",
         ]
 
-        if self.onefile.get():
+        if cfg['onefile']:
             cmd.append("--onefile")
-
-        if self.noconsole.get():
+        if cfg['noconsole']:
             cmd.append("--noconsole")
 
-        icon = self.icon_path.get()
+        icon = cfg['icon_path']
         if icon:
-            ico = self._convert_icon_to_ico(icon)
+            ico = self._convert_icon_to_ico(icon, cfg)
             if ico:
                 cmd.extend(["--icon", ico])
 
+        # P2-5: version metadata
+        ver_path = self._generate_version_file(cfg, build_tmp)
+        cmd.extend(["--version-file", ver_path])
+
         # Auto-detect hidden imports and native binaries
         hidden_imports = self._detect_hidden_imports(site_packages)
+        # P2-4: append user-specified extra hidden imports
+        extra_hi = cfg.get('hidden_imports_extra', '')
+        if extra_hi:
+            hidden_imports.extend(h.strip() for h in extra_hi.split(';') if h.strip())
         for hi in hidden_imports:
             cmd.extend(["--hidden-import", hi])
         if hidden_imports:
-            self.root.after(0, lambda h=hidden_imports: self._log(f"[INFO] Hidden imports detectados: {', '.join(h)}"))
+            self._log_threadsafe(f"[INFO] Hidden imports: {', '.join(hidden_imports)}")
 
         native_bins = self._collect_native_binaries(site_packages)
         for src, dest_pkg in native_bins:
             cmd.extend(["--add-binary", f"{src}{os.pathsep}{dest_pkg}"])
         if native_bins:
-            self.root.after(0, lambda n=native_bins: self._log(f"[INFO] Binarios nativos incluidos: {len(n)}"))
+            self._log_threadsafe(f"[INFO] Binarios nativos incluidos: {len(native_bins)}")
 
-        # Add extra files (.env, configs, etc.)
-        for fpath in self._get_extra_files():
-            cmd.extend(["--add-data", f"{fpath}{os.pathsep}."])
+        # P1-4: do NOT embed extra files via --add-data; copy next to exe instead
+        if self._get_extra_files(cfg):
+            self._log_threadsafe("[INFO] Archivos extra van junto al ejecutable (no embebidos).")
 
         cmd.append(script)
 
@@ -707,12 +1036,11 @@ class VenvToExeApp:
             if os.path.isfile(dst_exe):
                 os.remove(dst_exe)
             shutil.move(src_exe, dst_exe)
-            self.root.after(0, lambda: self._log(f"[INFO] Ejecutable movido a: {dst_exe}"))
+            self._log_threadsafe(f"[INFO] Ejecutable movido a: {dst_exe}")
         else:
             raise RuntimeError(f"No se encontro el exe generado en: {src_exe}")
 
-        # Copy extra files next to exe as well (for --onefile they extract to temp)
-        self._copy_extra_files_to_output(output, app_name)
+        self._copy_extra_files_to_output(output, cfg)
 
         # Cleanup temp
         temp_dir = os.path.join(output, "_temp_build")
@@ -720,34 +1048,38 @@ class VenvToExeApp:
             shutil.rmtree(temp_dir, ignore_errors=True)
         shutil.rmtree(build_tmp, ignore_errors=True)
 
-        self.root.after(0, lambda: self._log(f"\n[OK] Ejecutable Windows generado en: {output}"))
-        self.root.after(0, lambda: messagebox.showinfo("Listo", f"Ejecutable generado en:\n{output}"))
+        self._log_threadsafe(f"\n[OK] Ejecutable Windows generado en: {output}")
+        self.root.after(0, lambda o=output: messagebox.showinfo("Listo", f"Ejecutable generado en:\n{o}"))
 
-    def _build_macos(self):
-        self.root.after(0, lambda: self._log("=== Compilando para macOS ==="))
+    # ================================================= macOS build
 
-        venv_python = self._get_venv_python()
-        site_packages = self._get_venv_site_packages()
-        script = self.entry_script.get()
-        app_name = self.app_name.get().strip()
-        output = self.output_dir.get()
+    def _build_macos(self, cfg):
+        self._log_threadsafe("=== Compilando para macOS ===")
 
-        if self.autostart.get():
-            script = self._prepare_autostart_wrapper(script)
-            self.root.after(0, lambda: self._log("[INFO] Autostart para macOS habilitado."))
+        venv_python = self._get_venv_python(cfg)
+        site_packages = self._get_venv_site_packages(cfg)
+        script = cfg['entry_script']
+        app_name = cfg['app_name']
+        output = cfg['output_dir']
 
-        self.root.after(0, lambda: self._log("[INFO] Verificando PyInstaller en el venv..."))
+        if cfg['autostart']:
+            script = self._prepare_autostart_wrapper(script, cfg)
+            self._log_threadsafe("[INFO] Autostart para macOS habilitado.")
+
+        self._check_cancelled()
+        self._log_threadsafe("[INFO] Verificando PyInstaller en el venv...")
         try:
             self._run_cmd([venv_python, "-m", "pip", "install", "pyinstaller", "--quiet"])
         except Exception:
-            self.root.after(0, lambda: self._log("[AVISO] No se pudo instalar PyInstaller en venv, usando el del sistema."))
+            self._log_threadsafe("[AVISO] No se pudo instalar PyInstaller en venv, usando el del sistema.")
 
-        import tempfile
         build_tmp = tempfile.mkdtemp(prefix=f"{app_name}_build_")
-        self.root.after(0, lambda: self._log(f"[INFO] Carpeta temporal de build: {build_tmp}"))
+        self._log_threadsafe(f"[INFO] Carpeta temporal de build: {build_tmp}")
 
-        # Patch PyInstaller's modulegraph util.py to work around Python 3.10 RC dis bug
         self._patch_pyinstaller_dis_bug(site_packages)
+        self._check_cancelled()
+
+        original_script_dir = os.path.dirname(os.path.abspath(cfg['entry_script']))
 
         cmd = [
             venv_python, "-m", "PyInstaller",
@@ -756,19 +1088,26 @@ class VenvToExeApp:
             "--workpath", os.path.join(build_tmp, "work"),
             "--specpath", os.path.join(build_tmp, "work"),
             "--paths", site_packages,
+            "--paths", original_script_dir,
             "--noconfirm",
             "--clean",
             "--windowed",
         ]
 
-        if self.onefile.get():
+        if cfg['onefile']:
             cmd.append("--onefile")
 
-        icon = self.icon_path.get()
+        # P1-6: convert icon to .icns
+        icon = cfg['icon_path']
         if icon:
-            cmd.extend(["--icon", icon])
+            icns = self._convert_icon_to_icns(icon, cfg)
+            if icns:
+                cmd.extend(["--icon", icns])
 
         hidden_imports = self._detect_hidden_imports(site_packages)
+        extra_hi = cfg.get('hidden_imports_extra', '')
+        if extra_hi:
+            hidden_imports.extend(h.strip() for h in extra_hi.split(';') if h.strip())
         for hi in hidden_imports:
             cmd.extend(["--hidden-import", hi])
 
@@ -776,8 +1115,9 @@ class VenvToExeApp:
         for src, dest_pkg in native_bins:
             cmd.extend(["--add-binary", f"{src}{os.pathsep}{dest_pkg}"])
 
-        for fpath in self._get_extra_files():
-            cmd.extend(["--add-data", f"{fpath}{os.pathsep}."])
+        # P1-4: no --add-data for extra files
+        if self._get_extra_files(cfg):
+            self._log_threadsafe("[INFO] Archivos extra van junto al ejecutable (no embebidos).")
 
         cmd.append(script)
 
@@ -798,212 +1138,224 @@ class VenvToExeApp:
                     shutil.rmtree(dst)
                 shutil.move(src, dst)
 
-        self._copy_extra_files_to_output(output, app_name)
+        self._copy_extra_files_to_output(output, cfg)
 
         temp_dir = os.path.join(output, "_temp_build")
         if os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
         shutil.rmtree(build_tmp, ignore_errors=True)
 
-        self.root.after(0, lambda: self._log(f"\n[OK] Aplicacion macOS generada en: {output}"))
-        self.root.after(0, lambda: messagebox.showinfo("Listo", f"Aplicacion generada en:\n{output}"))
+        self._log_threadsafe(f"\n[OK] Aplicacion macOS generada en: {output}")
+        self.root.after(0, lambda o=output: messagebox.showinfo("Listo", f"Aplicacion generada en:\n{o}"))
 
-    # --- Android build via GitHub Actions ---
+    # ================================================= Android build
 
-    def _build_android(self):
-        self.root.after(0, lambda: self._log("=== Compilando para Android (APK) ==="))
-        self.root.after(0, lambda: self._log("[INFO] Usando GitHub Actions (Buildozer en la nube)."))
+    def _build_android(self, cfg):
+        self._log_threadsafe("=== Compilando para Android (APK) ===")
+        self._log_threadsafe("[INFO] Usando GitHub Actions (Buildozer en la nube).")
 
-        script = self.entry_script.get()
-        app_name = self.app_name.get().strip()
-        output = self.output_dir.get()
+        script = cfg['entry_script']
+        app_name = cfg['app_name']
+        output = cfg['output_dir']
         pkg_name = app_name.lower().replace(' ', '_').replace('-', '_')
-        import time as _time
-        repo_suffix = str(int(_time.time()))[-6:]
+        repo_suffix = str(int(time.time()))[-6:]
 
-        # 1. Check gh CLI
-        self.root.after(0, lambda: self._log("[INFO] Verificando GitHub CLI..."))
+        repo_name = None
+        build_dir = None
+        dl_dir = None
+
         try:
-            r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, errors='replace', **_hide_windows())
-            if r.returncode != 0:
-                raise RuntimeError("no auth")
-            self.root.after(0, lambda: self._log("[OK] GitHub CLI autenticado."))
-        except (FileNotFoundError, RuntimeError):
-            self.root.after(0, lambda: self._log(
-                "[ERROR] GitHub CLI no autenticado.\n"
-                "  Ejecuta en una terminal: gh auth login\n"
-                "  Luego reintenta."))
-            raise RuntimeError(
-                "GitHub CLI (gh) no esta autenticado.\n"
-                "Ejecuta 'gh auth login' en una terminal y reintenta.")
+            # 1. Check gh CLI and scopes (P0-8)
+            self._log_threadsafe("[INFO] Verificando GitHub CLI...")
+            try:
+                r = subprocess.run(["gh", "auth", "status"], capture_output=True,
+                                   text=True, errors='replace', **_hide_windows())
+                if r.returncode != 0:
+                    raise RuntimeError("no auth")
+                self._log_threadsafe("[OK] GitHub CLI autenticado.")
+                # Check delete_repo scope
+                auth_output = (r.stdout or '') + (r.stderr or '')
+                if 'delete_repo' not in auth_output:
+                    self._log_threadsafe(
+                        "[AVISO] El token de gh no tiene el scope delete_repo. "
+                        "Los repos temporales no se borraran automaticamente.\n"
+                        "  Ejecuta: gh auth refresh -h github.com -s delete_repo")
+            except FileNotFoundError:
+                raise RuntimeError(
+                    "GitHub CLI (gh) no esta instalado.\n"
+                    "Instalalo desde https://cli.github.com/ y ejecuta: gh auth login")
 
-        # 2. Get ALL imports from the script to ensure nothing is missing
-        venv_python = self._get_venv_python()
-        # Get top-level packages
-        result = subprocess.run(
-            [venv_python, "-c",
-             "import pkg_resources;"
-             "all_p={p.key for p in pkg_resources.working_set};"
-             "deps=set();"
-             "[deps.update(r.key for r in p.requires()) for p in pkg_resources.working_set];"
-             "skip={'pip','setuptools','wheel','pyinstaller','pywin32','pywin32-ctypes','pefile','altgraph','pyinstaller-hooks-contrib'};"
-             "top=all_p-deps-skip;"
-             "[print(p.key) for p in pkg_resources.working_set if p.key in top]"],
-            capture_output=True, text=True, **_hide_windows()
-        )
-        top_reqs = [r.strip() for r in result.stdout.strip().split('\n') if r.strip()]
+            self._check_cancelled()
 
-        # Also scan the script for direct imports and add them explicitly
-        import ast
-        try:
-            with open(script, 'r', encoding='utf-8') as f:
-                tree = ast.parse(f.read())
-            script_imports = set()
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        script_imports.add(alias.name.split('.')[0])
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    script_imports.add(node.module.split('.')[0])
-        except Exception:
-            script_imports = set()
+            # 2. Get top-level requirements (P0-5: importlib.metadata instead of pkg_resources)
+            venv_python = self._get_venv_python(cfg)
+            code = (
+                "import importlib.metadata as md;"
+                "dists={d.metadata['Name'].lower(): d for d in md.distributions() if d.metadata['Name']};"
+                "deps=set();"
+                "import re;"
+                "[deps.update(re.split(r'[ ;<>=!~\\\\[\\]]', r)[0].lower() for r in (d.requires or [])) for d in dists.values()];"
+                "skip={'pip','setuptools','wheel','pyinstaller','pywin32','pywin32-ctypes','pefile','altgraph','pyinstaller-hooks-contrib'};"
+                "[print(n) for n in sorted(dists) if n not in deps and n not in skip]"
+            )
+            result = subprocess.run([venv_python, "-c", code],
+                                    capture_output=True, text=True, **_hide_windows())
+            if result.returncode != 0:
+                self._log_threadsafe(f"[AVISO] Error detectando paquetes: {result.stderr.strip()}")
+            top_reqs = [r.strip() for r in result.stdout.strip().split('\n') if r.strip()]
 
-        # Map Python import names to pip package names
-        import_to_pip = {
-            'dotenv': 'python-dotenv', 'eth_account': 'eth-account',
-            'eth_keyfile': 'eth-keyfile', 'eth_keys': 'eth-keys',
-            'eth_rlp': 'eth-rlp', 'eth_typing': 'eth-typing',
-            'eth_utils': 'eth-utils', 'eth_hash': 'eth-hash',
-            'eth_abi': 'eth-abi', 'bip_utils': 'bip-utils',
-            'Crypto': 'pycryptodome', 'Cryptodome': 'pycryptodomex',
-            'nacl': 'PyNaCl', 'PIL': 'Pillow', 'yaml': 'PyYAML',
-            'cv2': 'opencv-python', 'sklearn': 'scikit-learn',
-        }
-        extra_reqs = set()
-        for imp in script_imports:
-            pip_name = import_to_pip.get(imp, imp)
-            extra_reqs.add(pip_name)
+            # Also scan the script for direct imports
+            try:
+                with open(script, 'r', encoding='utf-8') as f:
+                    tree = ast.parse(f.read())
+                script_imports = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            script_imports.add(alias.name.split('.')[0])
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        script_imports.add(node.module.split('.')[0])
+            except Exception:
+                script_imports = set()
 
-        # Merge top-level + script imports, deduplicate
-        all_reqs = list(dict.fromkeys(top_reqs + list(extra_reqs)))
-        # Filter stdlib modules
-        stdlib = {'os','sys','time','datetime','random','hashlib','hmac','json','re',
-                  'threading','traceback','concurrent','email','smtplib','base64',
-                  'collections','functools','itertools','math','struct','io','pathlib',
-                  'typing','abc','copy','enum','string','textwrap','unittest','logging',
-                  'socket','ssl','http','urllib','multiprocessing','signal','atexit',
-                  'subprocess','shutil','tempfile','glob','fnmatch','stat','zipfile'}
-        all_reqs = [r for r in all_reqs if r.lower().replace('-','_') not in stdlib]
+            import_to_pip = {
+                'dotenv': 'python-dotenv', 'eth_account': 'eth-account',
+                'eth_keyfile': 'eth-keyfile', 'eth_keys': 'eth-keys',
+                'eth_rlp': 'eth-rlp', 'eth_typing': 'eth-typing',
+                'eth_utils': 'eth-utils', 'eth_hash': 'eth-hash',
+                'eth_abi': 'eth-abi', 'bip_utils': 'bip-utils',
+                'Crypto': 'pycryptodome', 'Cryptodome': 'pycryptodomex',
+                'nacl': 'PyNaCl', 'PIL': 'Pillow', 'yaml': 'PyYAML',
+                'cv2': 'opencv-python', 'sklearn': 'scikit-learn',
+            }
+            extra_reqs = set()
+            for imp in script_imports:
+                extra_reqs.add(import_to_pip.get(imp, imp))
 
-        reqs_list = ",".join(all_reqs) if all_reqs else "kivy"
-        self.root.after(0, lambda r=all_reqs: self._log(f"[INFO] Paquetes: {', '.join(r)}"))
+            all_reqs = list(dict.fromkeys(top_reqs + list(extra_reqs)))
+            stdlib = {'os', 'sys', 'time', 'datetime', 'random', 'hashlib', 'hmac', 'json', 're',
+                      'threading', 'traceback', 'concurrent', 'email', 'smtplib', 'base64',
+                      'collections', 'functools', 'itertools', 'math', 'struct', 'io', 'pathlib',
+                      'typing', 'abc', 'copy', 'enum', 'string', 'textwrap', 'unittest', 'logging',
+                      'socket', 'ssl', 'http', 'urllib', 'multiprocessing', 'signal', 'atexit',
+                      'subprocess', 'shutil', 'tempfile', 'glob', 'fnmatch', 'stat', 'zipfile'}
+            all_reqs = [r for r in all_reqs if r.lower().replace('-', '_') not in stdlib]
 
-        # 3. Create temp build directory
-        import tempfile
-        build_dir = tempfile.mkdtemp(prefix=f"{app_name}_apk_")
-        self.root.after(0, lambda: self._log(f"[INFO] Preparando proyecto en: {build_dir}"))
+            reqs_list = ",".join(all_reqs) if all_reqs else "kivy"
+            self._log_threadsafe(f"[INFO] Paquetes: {', '.join(all_reqs)}")
 
-        # Copy the original script as a worker module
-        shutil.copy2(script, os.path.join(build_dir, os.path.basename(script).replace('.py', '_worker.py')))
-        worker_name = os.path.basename(script).replace('.py', '_worker')
+            self._check_cancelled()
 
-        # Copy extra files, renaming dotfiles (Buildozer ignores files starting with .)
-        for fpath in self._get_extra_files():
-            fname = os.path.basename(fpath)
-            if fname.startswith('.'):
-                fname = fname[1:] + '.txt'  # .env -> env.txt
-            shutil.copy2(fpath, os.path.join(build_dir, fname))
+            # 3. Create temp build directory
+            build_dir = tempfile.mkdtemp(prefix=f"{app_name}_apk_")
+            self._log_threadsafe(f"[INFO] Preparando proyecto en: {build_dir}")
 
-        # Copy icon
-        icon = self.icon_path.get()
-        if icon and os.path.isfile(icon):
-            shutil.copy2(icon, os.path.join(build_dir, "icon.png"))
+            # Copy the original script as a worker module
+            worker_name = os.path.basename(script).replace('.py', '_worker')
+            shutil.copy2(script, os.path.join(build_dir, worker_name + '.py'))
 
-        # Separate native packages (need p4a ARM64 recipes) from pure-Python
-        p4a_native = {
-            'pycryptodome', 'pycryptodomex', 'cryptography', 'cffi', 'pynacl',
-            'libsodium', 'openssl', 'pillow', 'numpy', 'scipy', 'opencv-python',
-            'lxml', 'bcrypt', 'gevent', 'greenlet', 'netifaces', 'psutil',
-            'ujson', 'msgpack', 'cymem', 'preshed',
-        }
-        # Map import names to p4a recipe names
-        import_to_p4a = {
-            'Crypto': 'pycryptodome', 'Cryptodome': 'pycryptodomex',
-            'nacl': 'pynacl', 'PIL': 'pillow', 'cv2': 'opencv',
-        }
-        # Detect which venv packages have native code (.pyd/.so)
-        site_packages = self._get_venv_site_packages()
-        detected_native = set()
-        for req in all_reqs:
-            req_dir = req.lower().replace('-', '_')
-            pkg_path = os.path.join(site_packages, req_dir)
-            if os.path.isdir(pkg_path):
-                for root_d, _, files in os.walk(pkg_path):
-                    if any(f.endswith(('.pyd', '.so')) for f in files):
-                        detected_native.add(req)
-                        break
+            # Copy extra files (rename dotfiles for Buildozer)
+            for fpath in self._get_extra_files(cfg):
+                fname = os.path.basename(fpath)
+                if fname.startswith('.'):
+                    fname = fname[1:] + '.txt'
+                shutil.copy2(fpath, os.path.join(build_dir, fname))
 
-        # Build the two lists
-        native_reqs = set()
-        pure_reqs = []
-        for req in all_reqs:
-            req_lower = req.lower().replace('-', '_')
-            # Check if it's a known native or detected native
-            if req_lower in {n.lower().replace('-','_') for n in p4a_native} or req in detected_native:
-                native_reqs.add(req)
+            # Copy icon
+            icon = cfg['icon_path']
+            if icon and os.path.isfile(icon):
+                shutil.copy2(icon, os.path.join(build_dir, "icon.png"))
+
+            # Separate native vs pure-Python packages
+            p4a_native = {
+                'pycryptodome', 'pycryptodomex', 'cryptography', 'cffi', 'pynacl',
+                'libsodium', 'openssl', 'pillow', 'numpy', 'scipy', 'opencv-python',
+                'lxml', 'bcrypt', 'gevent', 'greenlet', 'netifaces', 'psutil',
+                'ujson', 'msgpack', 'cymem', 'preshed',
+            }
+            import_to_p4a = {
+                'Crypto': 'pycryptodome', 'Cryptodome': 'pycryptodomex',
+                'nacl': 'pynacl', 'PIL': 'pillow', 'cv2': 'opencv',
+            }
+            site_packages = self._get_venv_site_packages(cfg)
+            detected_native = set()
+            for req in all_reqs:
+                req_dir = req.lower().replace('-', '_')
+                pkg_path = os.path.join(site_packages, req_dir)
+                if os.path.isdir(pkg_path):
+                    for root_d, _, files in os.walk(pkg_path):
+                        if any(f.endswith(('.pyd', '.so')) for f in files):
+                            detected_native.add(req)
+                            break
+
+            native_reqs = set()
+            pure_reqs = []
+            for req in all_reqs:
+                req_lower = req.lower().replace('-', '_')
+                if req_lower in {n.lower().replace('-', '_') for n in p4a_native} or req in detected_native:
+                    native_reqs.add(req)
+                else:
+                    pure_reqs.append(req)
+
+            for imp, p4a_name in import_to_p4a.items():
+                if imp in script_imports or any(imp.lower() in r.lower() for r in all_reqs):
+                    native_reqs.add(p4a_name)
+
+            if 'pynacl' in {n.lower() for n in native_reqs}:
+                native_reqs.add('libsodium')
+            if native_reqs & {'pycryptodome', 'pycryptodomex', 'cffi'}:
+                native_reqs.add('openssl')
+                native_reqs.add('cffi')
+
+            # P2-7: pin p4a.branch to master
+            buildozer_reqs = ['python3', 'kivy'] + sorted(native_reqs)
+            buildozer_reqs_str = ','.join(buildozer_reqs)
+
+            native_dirs = {'Crypto', 'Cryptodome', 'nacl', 'cffi', '_cffi_backend',
+                           'PIL', 'numpy', 'cv2', 'lxml', 'greenlet', 'gevent'}
+
+            self._log_threadsafe(
+                f"[INFO] Nativos (p4a): {', '.join(sorted(native_reqs))}\n"
+                f"[INFO] Pure-Python (pip): {', '.join(pure_reqs[:10])}{'...' if len(pure_reqs) > 10 else ''}")
+
+            # Create install_deps.sh
+            install_deps_content = '#!/bin/bash\nset -e\n\n'
+            install_deps_content += '# Install pure-Python packages (native ones compiled by p4a)\n'
+            if pure_reqs:
+                install_deps_content += 'pip install --target=site-packages --no-deps \\\n'
+                install_deps_content += ' \\\n'.join(f'    {p}' for p in pure_reqs)
+                install_deps_content += ' 2>&1\n\n'
+            install_deps_content += '# Remove native package dirs that conflict with p4a ARM64\n'
+            for d in sorted(native_dirs):
+                install_deps_content += f'rm -rf site-packages/{d} site-packages/{d.lower()}*\n'
+            install_deps_content += '\n# Remove all .so files (x86_64 from pip, not ARM64)\n'
+            install_deps_content += 'find site-packages -name "*.so" -delete 2>/dev/null || true\n'
+            install_deps_content += 'echo "Installed $(find site-packages -name \'*.py\' | wc -l) .py files"\n'
+
+            with open(os.path.join(build_dir, "install_deps.sh"), 'w', newline='\n') as f:
+                f.write(install_deps_content)
+
+            # P1-5: detect execution style and generate appropriate main.py
+            exec_style = self._detect_script_execution_style(script)
+            self._log_threadsafe(f"[INFO] Modo de ejecucion del script: {exec_style}")
+
+            if exec_style == 'main_guard':
+                worker_run_code = (
+                    f"            import runpy\n"
+                    f"            runpy.run_path(os.path.join(app_dir, '{worker_name}.py'), run_name='__main__')\n"
+                )
+            elif exec_style == 'main_func':
+                worker_run_code = (
+                    f"            import {worker_name}\n"
+                    f"            {worker_name}.main()\n"
+                )
             else:
-                pure_reqs.append(req)
+                worker_run_code = (
+                    f"            import {worker_name}\n"
+                )
 
-        # Always ensure these are in native requirements if any crypto package is used
-        for imp, p4a_name in import_to_p4a.items():
-            if imp in script_imports or any(imp.lower() in r.lower() for r in all_reqs):
-                native_reqs.add(p4a_name)
-
-        # pynacl needs libsodium
-        if 'pynacl' in {n.lower() for n in native_reqs}:
-            native_reqs.add('libsodium')
-        # pycryptodome/cffi need openssl
-        if native_reqs & {'pycryptodome', 'pycryptodomex', 'cffi'}:
-            native_reqs.add('openssl')
-            native_reqs.add('cffi')
-
-        # Buildozer requirements = python3 + kivy + native packages only
-        buildozer_reqs = ['python3', 'kivy'] + sorted(native_reqs)
-        buildozer_reqs_str = ','.join(buildozer_reqs)
-
-        # Native package directories to remove from site-packages (p4a compiles these)
-        native_dirs = {'Crypto', 'Cryptodome', 'nacl', 'cffi', '_cffi_backend',
-                       'PIL', 'numpy', 'cv2', 'lxml', 'greenlet', 'gevent'}
-
-        self.root.after(0, lambda n=native_reqs, p=pure_reqs: self._log(
-            f"[INFO] Nativos (p4a): {', '.join(sorted(n))}\n"
-            f"[INFO] Pure-Python (pip): {', '.join(p[:10])}{'...' if len(p) > 10 else ''}"))
-
-        # Create install_deps.sh for pure-Python packages
-        pure_pip_names = []
-        for req in pure_reqs:
-            pip_name = req  # already pip names from import_to_pip mapping
-            pure_pip_names.append(pip_name)
-
-        install_deps_content = '#!/bin/bash\nset -e\n\n'
-        install_deps_content += '# Install pure-Python packages (native ones are compiled by p4a for ARM64)\n'
-        if pure_pip_names:
-            install_deps_content += 'pip install --target=site-packages --no-deps \\\n'
-            install_deps_content += ' \\\n'.join(f'    {p}' for p in pure_pip_names)
-            install_deps_content += ' 2>&1\n\n'
-        install_deps_content += '# Remove native package dirs that conflict with p4a ARM64 versions\n'
-        for d in sorted(native_dirs):
-            install_deps_content += f'rm -rf site-packages/{d} site-packages/{d.lower()}*\n'
-        install_deps_content += '\n# Remove all .so files (x86_64 from pip, not ARM64)\n'
-        install_deps_content += 'find site-packages -name "*.so" -delete 2>/dev/null || true\n'
-        install_deps_content += 'echo "Installed $(find site-packages -name \'*.py\' | wc -l) .py files"\n'
-
-        with open(os.path.join(build_dir, "install_deps.sh"), 'w', newline='\n') as f:
-            f.write(install_deps_content)
-
-        # Create Kivy main.py wrapper
-        with open(os.path.join(build_dir, "main.py"), 'w', newline='\n') as f:
-            f.write(f'''import os, sys, threading, traceback
+            with open(os.path.join(build_dir, "main.py"), 'w', newline='\n') as f:
+                f.write(f'''import os, sys, threading, traceback
 app_dir = os.path.dirname(os.path.abspath(__file__))
 sp = os.path.join(app_dir, 'site-packages')
 if os.path.isdir(sp):
@@ -1051,10 +1403,7 @@ class MainApp(App):
             except Exception:
                 pass
 
-            import {worker_name}
-            if hasattr({worker_name}, 'main'):
-                {worker_name}.main()
-            self.log('Finalizado.')
+{worker_run_code}            self.log('Finalizado.')
         except Exception as e:
             self.log(f'ERROR: {{e}}')
             self.log(traceback.format_exc())
@@ -1063,10 +1412,10 @@ if __name__ == '__main__':
     MainApp().run()
 ''')
 
-        # Write buildozer.spec
-        icon_line = "icon.filename = icon.png" if icon else "# icon.filename ="
-        with open(os.path.join(build_dir, "buildozer.spec"), 'w', newline='\n') as f:
-            f.write(f"""[app]
+            # Write buildozer.spec
+            icon_line = "icon.filename = icon.png" if icon else "# icon.filename ="
+            with open(os.path.join(build_dir, "buildozer.spec"), 'w', newline='\n') as f:
+                f.write(f"""[app]
 title = {app_name}
 package.name = {pkg_name}
 package.domain = org.test
@@ -1082,29 +1431,24 @@ android.permissions = INTERNET
 android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
-p4a.branch = develop
+p4a.branch = master
 
 [buildozer]
 log_level = 2
 warn_on_root = 0
 """)
 
-        # Build list of pure-Python module names for APK verification
-        pure_module_names = []
-        for req in pure_reqs:
-            mod_name = req.lower().replace('-', '_')
-            pure_module_names.append(mod_name)
+            # Build verification module lists
+            pure_module_names = [req.lower().replace('-', '_') for req in pure_reqs]
+            mod_list_str = ', '.join(f"'{m}'" for m in pure_module_names[:30])
+            native_dir_list = ', '.join(f"'{d}'" for d in sorted(native_dirs))
 
-        # Write GitHub Actions workflow
-        wf_dir = os.path.join(build_dir, ".github", "workflows")
-        os.makedirs(wf_dir, exist_ok=True)
+            # Write GitHub Actions workflow
+            wf_dir = os.path.join(build_dir, ".github", "workflows")
+            os.makedirs(wf_dir, exist_ok=True)
 
-        # Module list for the verification script
-        mod_list_str = ', '.join(f"'{m}'" for m in pure_module_names[:30])
-        native_dir_list = ', '.join(f"'{d}'" for d in sorted(native_dirs))
-
-        with open(os.path.join(wf_dir, "build-apk.yml"), 'w', newline='\n') as f:
-            f.write(f"""name: Build APK
+            with open(os.path.join(wf_dir, "build-apk.yml"), 'w', newline='\n') as f:
+                f.write(f"""name: Build APK
 on:
   push:
   workflow_dispatch:
@@ -1176,108 +1520,229 @@ jobs:
           retention-days: 30
 """)
 
-        # Write .gitignore
-        with open(os.path.join(build_dir, ".gitignore"), 'w', newline='\n') as f:
-            f.write(".buildozer/\nbin/\n__pycache__/\n*.pyc\n")
+            # Write .gitignore
+            with open(os.path.join(build_dir, ".gitignore"), 'w', newline='\n') as f:
+                f.write(".buildozer/\nbin/\n__pycache__/\n*.pyc\n")
 
-        # 4. Create private GitHub repo and push
-        repo_name = f"_build-{pkg_name}-{repo_suffix}"
-        self.root.after(0, lambda: self._log(f"[INFO] Creando repo temporal: {repo_name}"))
+            self._check_cancelled()
 
-        # Delete repo if it already exists from a previous build
-        subprocess.run(["gh", "repo", "delete", repo_name, "--yes"],
-                        capture_output=True, errors='replace', **_hide_windows())
+            # 4. Create private GitHub repo and push
+            repo_name = f"_build-{pkg_name}-{repo_suffix}"
+            self._log_threadsafe(f"[INFO] Creando repo temporal: {repo_name}")
 
-        # Init git, force LF line endings, commit, create repo, push
-        self._run_cmd(["git", "init"], cwd=build_dir)
-        self._run_cmd(["git", "config", "core.autocrlf", "input"], cwd=build_dir)
-        self._run_cmd(["git", "add", "-A"], cwd=build_dir)
-        self._run_cmd(["git", "commit", "-m", "APK build"], cwd=build_dir)
-        self._run_cmd(["gh", "repo", "create", repo_name, "--private", "--source=.", "--push"], cwd=build_dir)
+            # Delete pre-existing repo (log failure per P0-8)
+            dr = subprocess.run(["gh", "repo", "delete", repo_name, "--yes"],
+                                capture_output=True, text=True, errors='replace', **_hide_windows())
+            if dr.returncode != 0 and 'not found' not in (dr.stderr or '').lower():
+                self._log_threadsafe(f"[AVISO] No se pudo eliminar repo previo: {(dr.stderr or '').strip()}")
 
-        self.root.after(0, lambda: self._log("[INFO] Codigo subido. Esperando que GitHub Actions compile..."))
-        self.root.after(0, lambda: self._log("[NOTA] Esto tarda 15-30 minutos la primera vez."))
+            # P1-9: set local git identity
+            self._run_cmd(["git", "init"], cwd=build_dir)
+            self._run_cmd(["git", "config", "user.email", "build@local"], cwd=build_dir)
+            self._run_cmd(["git", "config", "user.name", "venv_to_exe"], cwd=build_dir)
+            self._run_cmd(["git", "config", "core.autocrlf", "input"], cwd=build_dir)
+            self._run_cmd(["git", "add", "-A"], cwd=build_dir)
+            self._run_cmd(["git", "commit", "-m", "APK build"], cwd=build_dir)
+            self._run_cmd(["gh", "repo", "create", repo_name, "--private", "--source=.", "--push"], cwd=build_dir)
 
-        # 5. Wait for workflow to complete
-        max_wait = 5400  # 90 minutes
-        poll_interval = 30
-        waited = 0
-        run_id = None
+            self._log_threadsafe("[INFO] Codigo subido. Esperando que GitHub Actions compile...")
+            self._log_threadsafe("[NOTA] Esto tarda 15-30 minutos la primera vez.")
 
-        while waited < max_wait:
-            _time.sleep(poll_interval)
-            waited += poll_interval
+            # 5. Wait for workflow to complete
+            max_wait = 5400
+            poll_interval = 30
+            waited = 0
+            run_id = None
+            poll_count = 0
 
-            r = subprocess.run(
-                ["gh", "run", "list", "--repo", repo_name, "--limit", "1", "--json", "databaseId,status,conclusion"],
-                capture_output=True, text=True, errors='replace', **_hide_windows()
-            )
-            try:
-                import json
-                runs = json.loads(r.stdout)
-                if runs:
-                    run = runs[0]
-                    run_id = run['databaseId']
-                    status = run['status']
-                    conclusion = run.get('conclusion', '')
+            while waited < max_wait:
+                # P2-1: check cancel in polling loop
+                if self._cancel_event.is_set():
+                    raise RuntimeError("Build cancelado por el usuario.")
+                time.sleep(poll_interval)
+                waited += poll_interval
+                poll_count += 1
 
-                    mins = waited // 60
-                    self.root.after(0, lambda s=status, m=mins: self._log(f"  [{m}min] Estado: {s}"))
+                r = subprocess.run(
+                    ["gh", "run", "list", "--repo", repo_name, "--limit", "1",
+                     "--json", "databaseId,status,conclusion"],
+                    capture_output=True, text=True, errors='replace', **_hide_windows()
+                )
+                try:
+                    runs = json.loads(r.stdout)
+                    if runs:
+                        run = runs[0]
+                        run_id = run['databaseId']
+                        status = run['status']
+                        conclusion = run.get('conclusion', '')
+                        mins = waited // 60
+                        self._log_threadsafe(f"  [{mins}min] Estado: {status}")
 
-                    if status == 'completed':
-                        if conclusion == 'success':
-                            self.root.after(0, lambda: self._log("[OK] Build completado con exito!"))
-                            break
-                        else:
-                            # Show logs
-                            subprocess.run(["gh", "run", "view", str(run_id), "--repo", repo_name, "--log-failed"],
-                                            capture_output=True, **_hide_windows())
-                            raise RuntimeError(f"Build fallo con: {conclusion}")
-            except (json.JSONDecodeError, KeyError, IndexError):
-                pass
+                        # P2-8: fetch current step every 3rd poll
+                        if status == 'in_progress' and poll_count % 3 == 0:
+                            jr = subprocess.run(
+                                ["gh", "run", "view", str(run_id), "--repo", repo_name, "--json", "jobs"],
+                                capture_output=True, text=True, errors='replace', **_hide_windows()
+                            )
+                            try:
+                                jobs = json.loads(jr.stdout).get('jobs', [])
+                                for job in jobs:
+                                    for step in job.get('steps', []):
+                                        if step.get('status') == 'in_progress':
+                                            self._log_threadsafe(f"    Paso actual: {step.get('name', '?')}")
+                            except (json.JSONDecodeError, KeyError):
+                                pass
 
-        if waited >= max_wait:
-            raise RuntimeError("Timeout: el build tardo mas de 90 minutos.")
+                        if status == 'completed':
+                            if conclusion == 'success':
+                                self._log_threadsafe("[OK] Build completado con exito!")
+                                break
+                            else:
+                                # P0-7: capture and display failure logs
+                                fl = subprocess.run(
+                                    ["gh", "run", "view", str(run_id), "--repo", repo_name, "--log-failed"],
+                                    capture_output=True, text=True, errors='replace', **_hide_windows()
+                                )
+                                log_tail = (fl.stdout or '')[-8000:]
+                                self._log_threadsafe(f"[ERROR] Log del build fallido:\n{log_tail}")
+                                log_file = os.path.join(output, f"{app_name}_apk_build_failed.log")
+                                with open(log_file, 'w', encoding='utf-8') as lf:
+                                    lf.write(fl.stdout or '')
+                                self._log_threadsafe(f"[INFO] Log completo guardado en: {log_file}")
+                                # Get repo URL for inspection
+                                url_r = subprocess.run(
+                                    ["gh", "repo", "view", repo_name, "--json", "url", "--jq", ".url"],
+                                    capture_output=True, text=True, errors='replace', **_hide_windows()
+                                )
+                                repo_url = url_r.stdout.strip() or repo_name
+                                self._log_threadsafe(f"[INFO] Repo preservado para inspeccion: {repo_url}")
+                                raise RuntimeError(f"Build fallo con: {conclusion}")
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    pass
 
-        # 6. Download the APK artifact
-        self.root.after(0, lambda: self._log("[INFO] Descargando APK..."))
-        dl_dir = os.path.join(output, f"{app_name}_apk_download")
-        os.makedirs(dl_dir, exist_ok=True)
+            if waited >= max_wait:
+                raise RuntimeError("Timeout: el build tardo mas de 90 minutos.")
 
-        self._run_cmd([
-            "gh", "run", "download", str(run_id),
-            "--repo", repo_name,
-            "--name", "APK",
-            "--dir", dl_dir
-        ])
+            # 6. Download the APK artifact
+            self._log_threadsafe("[INFO] Descargando APK...")
+            dl_dir = os.path.join(output, f"{app_name}_apk_download")
+            os.makedirs(dl_dir, exist_ok=True)
 
-        # Move APK to output
-        apk_found = False
-        for f in os.listdir(dl_dir):
-            if f.endswith('.apk'):
-                src = os.path.join(dl_dir, f)
-                dst = os.path.join(output, f"{app_name}.apk")
-                shutil.move(src, dst)
-                self.root.after(0, lambda d=dst: self._log(f"[OK] APK descargado: {d}"))
-                apk_found = True
-                break
+            self._run_cmd([
+                "gh", "run", "download", str(run_id),
+                "--repo", repo_name,
+                "--name", "APK",
+                "--dir", dl_dir
+            ])
 
-        # 7. Cleanup: delete temp repo and local dirs
-        self.root.after(0, lambda: self._log("[INFO] Limpiando repo temporal..."))
-        subprocess.run(["gh", "repo", "delete", repo_name, "--yes"], capture_output=True, errors='replace', **_hide_windows())
-        shutil.rmtree(build_dir, ignore_errors=True)
-        shutil.rmtree(dl_dir, ignore_errors=True)
+            apk_found = False
+            for f in os.listdir(dl_dir):
+                if f.endswith('.apk'):
+                    src = os.path.join(dl_dir, f)
+                    dst = os.path.join(output, f"{app_name}.apk")
+                    shutil.move(src, dst)
+                    self._log_threadsafe(f"[OK] APK descargado: {dst}")
+                    apk_found = True
+                    break
 
-        if apk_found:
-            self.root.after(0, lambda: self._log(f"\n[OK] APK Android generado en: {output}"))
-            self.root.after(0, lambda: messagebox.showinfo("Listo", f"APK generado en:\n{output}"))
-        else:
-            raise RuntimeError("No se encontro el APK en los artifacts de GitHub Actions.")
+            # 7. Cleanup on success
+            self._log_threadsafe("[INFO] Limpiando repo temporal...")
+            dr = subprocess.run(["gh", "repo", "delete", repo_name, "--yes"],
+                                capture_output=True, text=True, errors='replace', **_hide_windows())
+            if dr.returncode != 0:
+                self._log_threadsafe(f"[AVISO] No se pudo eliminar repo: {(dr.stderr or '').strip()}")
+
+            if apk_found:
+                self._log_threadsafe(f"\n[OK] APK Android generado en: {output}")
+                self.root.after(0, lambda o=output: messagebox.showinfo("Listo", f"APK generado en:\n{o}"))
+            else:
+                raise RuntimeError("No se encontro el APK en los artifacts de GitHub Actions.")
+
+        except Exception as e:
+            # On cancel, try to delete repo; on other failure, preserve it
+            if self._cancel_event.is_set() and repo_name:
+                dr = subprocess.run(["gh", "repo", "delete", repo_name, "--yes"],
+                                    capture_output=True, text=True, errors='replace', **_hide_windows())
+                if dr.returncode == 0:
+                    self._log_threadsafe(f"[INFO] Repo temporal {repo_name} eliminado.")
+            raise
+        finally:
+            if build_dir and os.path.isdir(build_dir):
+                shutil.rmtree(build_dir, ignore_errors=True)
+            if dl_dir and os.path.isdir(dl_dir):
+                shutil.rmtree(dl_dir, ignore_errors=True)
+
+    # ========================================== Settings persistence (P2-2)
+
+    def _load_settings(self):
+        if not os.path.isfile(SETTINGS_FILE):
+            return
+        try:
+            with open(SETTINGS_FILE, 'r') as f:
+                s = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return
+        str_map = {
+            'app_name': self.app_name, 'venv_path': self.venv_path,
+            'entry_script': self.entry_script, 'icon_path': self.icon_path,
+            'output_dir': self.output_dir, 'extra_files': self.extra_files,
+            'hidden_imports_extra': self.hidden_imports_extra,
+            'version': self.version_var, 'company': self.company_var,
+        }
+        bool_map = {
+            'autostart': self.autostart, 'onefile': self.onefile,
+            'noconsole': self.noconsole, 'allow_multiple': self.allow_multiple,
+        }
+        for key, var in str_map.items():
+            if s.get(key):
+                var.set(s[key])
+        for key, var in bool_map.items():
+            if key in s:
+                var.set(s[key])
+        # Only load platform if valid for host
+        plat = s.get('platform')
+        if plat == 'android' or (plat == 'windows' and sys.platform == 'win32') or \
+                (plat == 'macos' and sys.platform == 'darwin'):
+            self.platform_var.set(plat)
+        icon = self.icon_path.get()
+        if icon and os.path.isfile(icon):
+            self._update_icon_preview(icon)
+        self._on_platform_change()
+
+    def _save_settings(self):
+        settings = {
+            'app_name': self.app_name.get().strip(),
+            'venv_path': self.venv_path.get(),
+            'entry_script': self.entry_script.get(),
+            'icon_path': self.icon_path.get(),
+            'output_dir': self.output_dir.get(),
+            'platform': self.platform_var.get(),
+            'autostart': self.autostart.get(),
+            'onefile': self.onefile.get(),
+            'noconsole': self.noconsole.get(),
+            'allow_multiple': self.allow_multiple.get(),
+            'extra_files': self.extra_files.get(),
+            'hidden_imports_extra': self.hidden_imports_extra.get(),
+            'version': self.version_var.get(),
+            'company': self.company_var.get(),
+        }
+        # Only persist non-empty string values and all booleans
+        settings = {k: v for k, v in settings.items() if v or isinstance(v, bool)}
+        try:
+            os.makedirs(SETTINGS_DIR, exist_ok=True)
+            with open(SETTINGS_FILE, 'w') as f:
+                json.dump(settings, f, indent=2)
+        except Exception:
+            pass
+
+    def _on_close(self):
+        self._save_settings()
+        self.root.destroy()
 
 
 def main():
     root = tk.Tk()
-    app = VenvToExeApp(root)
+    VenvToExeApp(root)
     root.mainloop()
 
 
