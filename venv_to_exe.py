@@ -527,6 +527,37 @@ class VenvToExeApp:
             except Exception as e:
                 self.root.after(0, lambda e=e: self._log(f"[AVISO] No se pudo copiar archivo extra: {e}"))
 
+    def _patch_pyinstaller_dis_bug(self, site_packages):
+        """Patch PyInstaller's modulegraph/util.py to handle Python 3.10 RC dis.get_instructions bug."""
+        util_path = os.path.join(site_packages, 'PyInstaller', 'lib', 'modulegraph', 'util.py')
+        if not os.path.isfile(util_path):
+            return
+        with open(util_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        # Already patched?
+        if 'IndexError' in content:
+            return
+        # Original line:
+        #   yield from (i for i in dis.get_instructions(code_object) if i.opname != "EXTENDED_ARG")
+        # Replace with a version that catches IndexError from buggy dis module
+        old = '    yield from (i for i in dis.get_instructions(code_object) if i.opname != "EXTENDED_ARG")'
+        new = (
+            '    try:\n'
+            '        _instructions = [i for i in dis.get_instructions(code_object) if i.opname != "EXTENDED_ARG"]\n'
+            '    except IndexError:\n'
+            '        return  # Skip modules with bytecode incompatible with this Python version\n'
+            '    yield from _instructions'
+        )
+        if old in content:
+            content = content.replace(old, new)
+            with open(util_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            # Remove cached bytecode so the patched .py is used
+            cache_dir = os.path.join(os.path.dirname(util_path), '__pycache__')
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir, ignore_errors=True)
+            self.root.after(0, lambda: self._log("[INFO] Parcheado PyInstaller para compatibilidad con Python 3.10 RC"))
+
     def _detect_hidden_imports(self, site_packages):
         """Scan site-packages for native modules PyInstaller often misses."""
         hidden = []
@@ -620,6 +651,9 @@ class VenvToExeApp:
         build_tmp = tempfile.mkdtemp(prefix=f"{app_name}_build_")
         self.root.after(0, lambda: self._log(f"[INFO] Carpeta temporal de build: {build_tmp}"))
 
+        # Patch PyInstaller's modulegraph util.py to work around Python 3.10 RC dis bug
+        self._patch_pyinstaller_dis_bug(site_packages)
+
         # Build command
         cmd = [
             venv_python, "-m", "PyInstaller",
@@ -712,6 +746,9 @@ class VenvToExeApp:
         build_tmp = tempfile.mkdtemp(prefix=f"{app_name}_build_")
         self.root.after(0, lambda: self._log(f"[INFO] Carpeta temporal de build: {build_tmp}"))
 
+        # Patch PyInstaller's modulegraph util.py to work around Python 3.10 RC dis bug
+        self._patch_pyinstaller_dis_bug(site_packages)
+
         cmd = [
             venv_python, "-m", "PyInstaller",
             "--name", app_name,
@@ -800,8 +837,9 @@ class VenvToExeApp:
                 "GitHub CLI (gh) no esta autenticado.\n"
                 "Ejecuta 'gh auth login' en una terminal y reintenta.")
 
-        # 2. Get top-level requirements only (pip resolves compatible transitive deps)
+        # 2. Get ALL imports from the script to ensure nothing is missing
         venv_python = self._get_venv_python()
+        # Get top-level packages
         result = subprocess.run(
             [venv_python, "-c",
              "import pkg_resources;"
@@ -813,43 +851,230 @@ class VenvToExeApp:
              "[print(p.key) for p in pkg_resources.working_set if p.key in top]"],
             capture_output=True, text=True, **_hide_windows()
         )
-        reqs = [r.strip() for r in result.stdout.strip().split('\n') if r.strip()]
-        reqs_txt = '\n'.join(reqs)
+        top_reqs = [r.strip() for r in result.stdout.strip().split('\n') if r.strip()]
 
-        # 3. Create temp build directory with all needed files
+        # Also scan the script for direct imports and add them explicitly
+        import ast
+        try:
+            with open(script, 'r', encoding='utf-8') as f:
+                tree = ast.parse(f.read())
+            script_imports = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        script_imports.add(alias.name.split('.')[0])
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    script_imports.add(node.module.split('.')[0])
+        except Exception:
+            script_imports = set()
+
+        # Map Python import names to pip package names
+        import_to_pip = {
+            'dotenv': 'python-dotenv', 'eth_account': 'eth-account',
+            'eth_keyfile': 'eth-keyfile', 'eth_keys': 'eth-keys',
+            'eth_rlp': 'eth-rlp', 'eth_typing': 'eth-typing',
+            'eth_utils': 'eth-utils', 'eth_hash': 'eth-hash',
+            'eth_abi': 'eth-abi', 'bip_utils': 'bip-utils',
+            'Crypto': 'pycryptodome', 'Cryptodome': 'pycryptodomex',
+            'nacl': 'PyNaCl', 'PIL': 'Pillow', 'yaml': 'PyYAML',
+            'cv2': 'opencv-python', 'sklearn': 'scikit-learn',
+        }
+        extra_reqs = set()
+        for imp in script_imports:
+            pip_name = import_to_pip.get(imp, imp)
+            extra_reqs.add(pip_name)
+
+        # Merge top-level + script imports, deduplicate
+        all_reqs = list(dict.fromkeys(top_reqs + list(extra_reqs)))
+        # Filter stdlib modules
+        stdlib = {'os','sys','time','datetime','random','hashlib','hmac','json','re',
+                  'threading','traceback','concurrent','email','smtplib','base64',
+                  'collections','functools','itertools','math','struct','io','pathlib',
+                  'typing','abc','copy','enum','string','textwrap','unittest','logging',
+                  'socket','ssl','http','urllib','multiprocessing','signal','atexit',
+                  'subprocess','shutil','tempfile','glob','fnmatch','stat','zipfile'}
+        all_reqs = [r for r in all_reqs if r.lower().replace('-','_') not in stdlib]
+
+        reqs_list = ",".join(all_reqs) if all_reqs else "kivy"
+        self.root.after(0, lambda r=all_reqs: self._log(f"[INFO] Paquetes: {', '.join(r)}"))
+
+        # 3. Create temp build directory
         import tempfile
         build_dir = tempfile.mkdtemp(prefix=f"{app_name}_apk_")
         self.root.after(0, lambda: self._log(f"[INFO] Preparando proyecto en: {build_dir}"))
 
-        # Copy script as main.py
-        shutil.copy2(script, os.path.join(build_dir, "main.py"))
+        # Copy the original script as a worker module
+        shutil.copy2(script, os.path.join(build_dir, os.path.basename(script).replace('.py', '_worker.py')))
+        worker_name = os.path.basename(script).replace('.py', '_worker')
 
-        # Copy extra files
+        # Copy extra files, renaming dotfiles (Buildozer ignores files starting with .)
         for fpath in self._get_extra_files():
-            shutil.copy2(fpath, os.path.join(build_dir, os.path.basename(fpath)))
+            fname = os.path.basename(fpath)
+            if fname.startswith('.'):
+                fname = fname[1:] + '.txt'  # .env -> env.txt
+            shutil.copy2(fpath, os.path.join(build_dir, fname))
 
         # Copy icon
         icon = self.icon_path.get()
         if icon and os.path.isfile(icon):
             shutil.copy2(icon, os.path.join(build_dir, "icon.png"))
 
-        # Write requirements.txt
-        with open(os.path.join(build_dir, "requirements.txt"), 'w', newline='\n') as f:
-            f.write(reqs_txt)
+        # Separate native packages (need p4a ARM64 recipes) from pure-Python
+        p4a_native = {
+            'pycryptodome', 'pycryptodomex', 'cryptography', 'cffi', 'pynacl',
+            'libsodium', 'openssl', 'pillow', 'numpy', 'scipy', 'opencv-python',
+            'lxml', 'bcrypt', 'gevent', 'greenlet', 'netifaces', 'psutil',
+            'ujson', 'msgpack', 'cymem', 'preshed',
+        }
+        # Map import names to p4a recipe names
+        import_to_p4a = {
+            'Crypto': 'pycryptodome', 'Cryptodome': 'pycryptodomex',
+            'nacl': 'pynacl', 'PIL': 'pillow', 'cv2': 'opencv',
+        }
+        # Detect which venv packages have native code (.pyd/.so)
+        site_packages = self._get_venv_site_packages()
+        detected_native = set()
+        for req in all_reqs:
+            req_dir = req.lower().replace('-', '_')
+            pkg_path = os.path.join(site_packages, req_dir)
+            if os.path.isdir(pkg_path):
+                for root_d, _, files in os.walk(pkg_path):
+                    if any(f.endswith(('.pyd', '.so')) for f in files):
+                        detected_native.add(req)
+                        break
+
+        # Build the two lists
+        native_reqs = set()
+        pure_reqs = []
+        for req in all_reqs:
+            req_lower = req.lower().replace('-', '_')
+            # Check if it's a known native or detected native
+            if req_lower in {n.lower().replace('-','_') for n in p4a_native} or req in detected_native:
+                native_reqs.add(req)
+            else:
+                pure_reqs.append(req)
+
+        # Always ensure these are in native requirements if any crypto package is used
+        for imp, p4a_name in import_to_p4a.items():
+            if imp in script_imports or any(imp.lower() in r.lower() for r in all_reqs):
+                native_reqs.add(p4a_name)
+
+        # pynacl needs libsodium
+        if 'pynacl' in {n.lower() for n in native_reqs}:
+            native_reqs.add('libsodium')
+        # pycryptodome/cffi need openssl
+        if native_reqs & {'pycryptodome', 'pycryptodomex', 'cffi'}:
+            native_reqs.add('openssl')
+            native_reqs.add('cffi')
+
+        # Buildozer requirements = python3 + kivy + native packages only
+        buildozer_reqs = ['python3', 'kivy'] + sorted(native_reqs)
+        buildozer_reqs_str = ','.join(buildozer_reqs)
+
+        # Native package directories to remove from site-packages (p4a compiles these)
+        native_dirs = {'Crypto', 'Cryptodome', 'nacl', 'cffi', '_cffi_backend',
+                       'PIL', 'numpy', 'cv2', 'lxml', 'greenlet', 'gevent'}
+
+        self.root.after(0, lambda n=native_reqs, p=pure_reqs: self._log(
+            f"[INFO] Nativos (p4a): {', '.join(sorted(n))}\n"
+            f"[INFO] Pure-Python (pip): {', '.join(p[:10])}{'...' if len(p) > 10 else ''}"))
+
+        # Create install_deps.sh for pure-Python packages
+        pure_pip_names = []
+        for req in pure_reqs:
+            pip_name = req  # already pip names from import_to_pip mapping
+            pure_pip_names.append(pip_name)
+
+        install_deps_content = '#!/bin/bash\nset -e\n\n'
+        install_deps_content += '# Install pure-Python packages (native ones are compiled by p4a for ARM64)\n'
+        if pure_pip_names:
+            install_deps_content += 'pip install --target=site-packages --no-deps \\\n'
+            install_deps_content += ' \\\n'.join(f'    {p}' for p in pure_pip_names)
+            install_deps_content += ' 2>&1\n\n'
+        install_deps_content += '# Remove native package dirs that conflict with p4a ARM64 versions\n'
+        for d in sorted(native_dirs):
+            install_deps_content += f'rm -rf site-packages/{d} site-packages/{d.lower()}*\n'
+        install_deps_content += '\n# Remove all .so files (x86_64 from pip, not ARM64)\n'
+        install_deps_content += 'find site-packages -name "*.so" -delete 2>/dev/null || true\n'
+        install_deps_content += 'echo "Installed $(find site-packages -name \'*.py\' | wc -l) .py files"\n'
+
+        with open(os.path.join(build_dir, "install_deps.sh"), 'w', newline='\n') as f:
+            f.write(install_deps_content)
+
+        # Create Kivy main.py wrapper
+        with open(os.path.join(build_dir, "main.py"), 'w', newline='\n') as f:
+            f.write(f'''import os, sys, threading, traceback
+app_dir = os.path.dirname(os.path.abspath(__file__))
+sp = os.path.join(app_dir, 'site-packages')
+if os.path.isdir(sp):
+    sys.path.append(sp)
+os.chdir(app_dir)
+
+from kivy.app import App
+from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.clock import Clock
+from kivy.core.window import Window
+
+class MainApp(App):
+    def build(self):
+        Window.clearcolor = (0.1, 0.1, 0.1, 1)
+        self.label = Label(
+            text='{app_name}\\nIniciando...',
+            font_size='16sp', halign='center', valign='top',
+            size_hint_y=None, text_size=(Window.width - 40, None))
+        self.label.bind(texture_size=self.label.setter('size'))
+        scroll = ScrollView()
+        scroll.add_widget(self.label)
+        Clock.schedule_once(self.start_worker, 2)
+        return scroll
+
+    def log(self, msg):
+        def update(dt):
+            self.label.text += '\\n' + msg
+        Clock.schedule_once(update)
+
+    def start_worker(self, dt):
+        self.log('Ejecutando...')
+        threading.Thread(target=self.run_worker, daemon=True).start()
+
+    def run_worker(self):
+        try:
+            try:
+                from dotenv import load_dotenv
+                for env_name in ['env.txt', '.env']:
+                    env_path = os.path.join(app_dir, env_name)
+                    if os.path.exists(env_path):
+                        load_dotenv(env_path)
+                        self.log(f'Config cargada: {{env_name}}')
+                        break
+            except Exception:
+                pass
+
+            import {worker_name}
+            if hasattr({worker_name}, 'main'):
+                {worker_name}.main()
+            self.log('Finalizado.')
+        except Exception as e:
+            self.log(f'ERROR: {{e}}')
+            self.log(traceback.format_exc())
+
+if __name__ == '__main__':
+    MainApp().run()
+''')
 
         # Write buildozer.spec
         icon_line = "icon.filename = icon.png" if icon else "# icon.filename ="
-        reqs_list = ",".join(r.split('==')[0] for r in reqs) if reqs else "kivy"
         with open(os.path.join(build_dir, "buildozer.spec"), 'w', newline='\n') as f:
             f.write(f"""[app]
 title = {app_name}
 package.name = {pkg_name}
 package.domain = org.test
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,ico,env,json,txt
+source.include_exts = py,pyc,pyd,so,png,jpg,kv,atlas,ico,env,json,txt
 source.exclude_dirs = .git,.github,__pycache__,venv,.venv
 version = 1.0.0
-requirements = python3,{reqs_list}
+requirements = {buildozer_reqs_str}
 {icon_line}
 orientation = portrait
 fullscreen = 0
@@ -857,18 +1082,29 @@ android.permissions = INTERNET
 android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
-p4a.branch = master
+p4a.branch = develop
 
 [buildozer]
 log_level = 2
 warn_on_root = 0
 """)
 
+        # Build list of pure-Python module names for APK verification
+        pure_module_names = []
+        for req in pure_reqs:
+            mod_name = req.lower().replace('-', '_')
+            pure_module_names.append(mod_name)
+
         # Write GitHub Actions workflow
         wf_dir = os.path.join(build_dir, ".github", "workflows")
         os.makedirs(wf_dir, exist_ok=True)
+
+        # Module list for the verification script
+        mod_list_str = ', '.join(f"'{m}'" for m in pure_module_names[:30])
+        native_dir_list = ', '.join(f"'{d}'" for d in sorted(native_dirs))
+
         with open(os.path.join(wf_dir, "build-apk.yml"), 'w', newline='\n') as f:
-            f.write("""name: Build APK
+            f.write(f"""name: Build APK
 on:
   push:
   workflow_dispatch:
@@ -886,12 +1122,52 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential git zip unzip \\
             openjdk-17-jdk autoconf automake libtool libltdl-dev pkg-config \\
-            libffi-dev libssl-dev cmake zlib1g-dev ccache \\
-            lld
+            libffi-dev libssl-dev cmake zlib1g-dev ccache lld
       - name: Install buildozer
-        run: pip install buildozer cython
+        run: pip install buildozer==1.5.0 cython
+      - name: Pre-install Python packages
+        run: bash install_deps.sh
       - name: Build APK
         run: yes | buildozer android debug
+      - name: Verify APK contents
+        if: always()
+        run: |
+          APK=$(find bin -name "*.apk" 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then echo "NO APK FOUND"; exit 1; fi
+          echo "APK: $APK ($(du -h "$APK" | cut -f1))"
+          python3 << 'PYEOF'
+          import zipfile, io, tarfile, sys, os
+          apk = [f for f in os.listdir("bin") if f.endswith(".apk")][0]
+          with zipfile.ZipFile(os.path.join("bin", apk)) as z:
+              if "assets/private.tar" not in z.namelist():
+                  print("FATAL: assets/private.tar not found"); sys.exit(1)
+              tar_data = z.read("assets/private.tar")
+          with tarfile.open(fileobj=io.BytesIO(tar_data)) as t:
+              names = t.getnames()
+              print(f"Files in private.tar: {{len(names)}}")
+              errors = []
+              pure_mods = [{mod_list_str}]
+              for mod in pure_mods:
+                  found = [n for n in names if n.startswith(f"site-packages/{{mod}}/") or f"/{{mod}}.py" in n or n == f"{{mod}}.py"]
+                  print(f"  {{'OK' if found else 'MISSING'}}: {{mod}} ({{len(found)}})")
+                  if not found: errors.append(mod)
+              for mod in [{native_dir_list}]:
+                  bad = [n for n in names if n.startswith(f"site-packages/{{mod}}/")]
+                  if bad:
+                      print(f"  CONFLICT: {{mod}} in site-packages ({{len(bad)}})")
+                      errors.append(f"{{mod}}_conflict")
+              so_bad = [n for n in names if 'site-packages' in n and n.endswith('.so')]
+              if so_bad:
+                  print(f"  BAD: {{len(so_bad)}} .so files in site-packages")
+                  errors.append("so_files")
+              for f in ['main.py', '{worker_name}.py']:
+                  if f not in names: errors.append(f); print(f"  MISSING: {{f}}")
+                  else: print(f"  OK: {{f}}")
+              if errors:
+                  print(f"FAIL: {{errors}}"); sys.exit(1)
+              else:
+                  print("PASS - APK looks good for ARM64")
+          PYEOF
       - uses: actions/upload-artifact@v4
         if: always()
         with:
